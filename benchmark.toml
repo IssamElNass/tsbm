@@ -23,10 +23,14 @@
 # ── Databases ─────────────────────────────────────────────────────────────────
 
 [databases.questdb]
-enabled   = true
-host      = "localhost"
-ilp_port  = 9000
-pg_port   = 8812
+enabled      = true
+host         = "localhost"
+ilp_port     = 5001
+pg_port      = 8812
+# Table partition granularity.  Valid values: HOUR, DAY, WEEK, MONTH, YEAR.
+# Use HOUR for dense datasets (millions of rows per day) or high-frequency
+# time-range queries on short windows.  DAY is the safe default.
+partition_by = "HOUR"
 
 [databases.cratedb]
 enabled   = true
@@ -35,12 +39,16 @@ http_port = 4200
 pg_port   = 5432
 
 [databases.timescaledb]
-enabled   = true
-host      = "localhost"
-pg_port   = 5433       # host-mapped port — Docker maps 5433 → 5432 inside the container
-user      = "postgres"
-password  = "postgres"
-dbname    = "tsbm"
+enabled              = true
+host                 = "localhost"
+pg_port              = 5433       # host-mapped port — Docker maps 5433 → 5432 inside the container
+user                 = "postgres"
+password             = "postgres"
+dbname               = "tsbm"
+# Hypertable chunk interval passed to create_hypertable().
+# Use "1 day" for high-frequency data (millions of rows per day).
+# "7 days" is the safe default for sparser datasets.
+chunk_time_interval  = "7 days"
 
 # ── Workload ──────────────────────────────────────────────────────────────────
 
@@ -60,10 +68,14 @@ dataset = "datasets/small_iot.csv"
 #   ~100 K rows   →  [1_000, 10_000, 50_000, 100_000]
 #   ~11 M rows    →  [10_000, 100_000, 500_000, 1_000_000]
 #   ~100 M rows   →  [50_000, 500_000, 2_000_000, 10_000_000]
-batch_sizes = [10_000, 100_000, 500_000, 1_000_000]
+# For ~30 M row datasets on a laptop, keep batch_sizes ≤ 500_000 and
+# workers ≤ 4 to avoid RAM exhaustion (each sub-batch lives in memory
+# simultaneously: workers × batch_size × ~70 bytes).
+batch_sizes = [10_000, 100_000, 500_000]
 
 # Number of concurrent writer tasks per batch.
-workers = [1, 4, 8, 16]
+# Reduce to [1, 2, 4] on machines with < 16 GB RAM.
+workers = [1, 4, 8]
 
 # Warmup iterations executed (and discarded) before measurement begins.
 # Warms caches, JIT, and connection pools.
@@ -90,17 +102,35 @@ mixed_duration_seconds = 60
 reset_between_rounds = false
 
 # ── Streaming ─────────────────────────────────────────────────────────────────
-# Datasets larger than this row count are read from disk in chunks instead of
-# being loaded fully into RAM.
+# When the dataset row count exceeds this threshold the run command automatically
+# switches to streaming mode — rows are fed to the database in chunks rather
+# than loading the whole file into RAM at once.  Schema is inferred from the
+# first 50 K rows so the full file is never read eagerly.
 #
-# Rule of thumb: set to ~10 % of the expected row count, minimum 500 K.
-#   11 M dataset  → 1_000_000
-#   100 M dataset → 5_000_000  (or lower if RAM is tight)
-streaming_threshold_rows = 1_000_000
+# Rule of thumb:
+#   8 GB laptop, 30 M rows  → 500_000  (chunks keep peak RAM < 200 MB)
+#   16 GB desktop            → 2_000_000
+#   32 GB+ server            → 5_000_000+
+streaming_threshold_rows = 500_000
 
-# Rows per streaming chunk.  Larger values = fewer I/O round-trips but higher
-# peak RAM.  500 K–2 M is a good range for machines with 16 GB+ RAM.
-chunk_size = 500_000
+# Rows per streaming chunk.
+# Lower = less RAM per chunk but more round-trips.  50 K–200 K is a good
+# range for laptops with 8–16 GB RAM.
+# At ~70 bytes/row:  50_000 rows ≈ 3.5 MB  |  200_000 rows ≈ 14 MB per chunk.
+chunk_size = 100_000
+
+# ── Query column overrides ────────────────────────────────────────────────────
+# By default every aggregation and GROUP BY uses the first metric / tag column
+# in the dataset schema.  If your dataset has an ID or non-numeric column at
+# position 0, override these to point at the column you actually want to measure.
+#
+# Examples:
+#   agg_metric_col   = "temperature"   # AVG/MIN/MAX this column
+#   group_by_tag_col = "device_id"     # GROUP BY / PARTITION BY this column
+#
+# Leave commented out to use the auto-detected first column.
+# agg_metric_col   = ""
+# group_by_tag_col = ""
 
 # ── Materialized views ────────────────────────────────────────────────────────
 

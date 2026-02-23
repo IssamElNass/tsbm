@@ -187,6 +187,89 @@ def load_dataset_streaming(
     )
 
 
+def estimate_row_count(path: Path) -> int:
+    """
+    Cheaply estimate the number of rows in *path* without reading the full file.
+
+    * **Parquet** — exact count from file metadata (near-instant).
+    * **CSV / other** — rough estimate based on file size assuming ~80 bytes
+      per row on disk.  Good enough to decide whether streaming is warranted.
+    """
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix in {".parquet", ".parq"}:
+        try:
+            return pq.ParquetFile(path).metadata.num_rows
+        except Exception:
+            pass
+    try:
+        return path.stat().st_size // 80
+    except Exception:
+        return 0
+
+
+def infer_schema_from_sample(
+    path: Path,
+    sample_rows: int = 50_000,
+    tag_cardinality_threshold: float = 0.05,
+) -> DatasetSchema:
+    """
+    Read the first *sample_rows* rows of *path* and infer a
+    :class:`DatasetSchema` — without loading the whole file.
+
+    Used by the run orchestrator to get a ``schema_hint`` before switching to
+    streaming mode for large datasets.
+
+    Parameters
+    ----------
+    path:
+        CSV or Parquet dataset file.
+    sample_rows:
+        Maximum rows to read for schema and cardinality inference.
+    tag_cardinality_threshold:
+        Fraction of sample rows below which a string column is classed as TAG.
+    """
+    path = Path(path)
+    suffix = path.suffix.lower()
+
+    if suffix in {".parquet", ".parq"}:
+        batch = next(pq.ParquetFile(path).iter_batches(batch_size=sample_rows), None)
+        if batch is None:
+            raise DatasetError(f"Parquet file {path} appears to be empty")
+        sample: pa.Table = pa.Table.from_batches([batch])
+    elif suffix == ".csv":
+        opts = pa_csv.ConvertOptions(
+            timestamp_parsers=[
+                "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d",
+            ]
+        )
+        reader = pa_csv.open_csv(path, convert_options=opts)
+        batches: list[pa.RecordBatch] = []
+        n_read = 0
+        while n_read < sample_rows:
+            try:
+                b = reader.read_next_batch()
+                batches.append(b)
+                n_read += len(b)
+            except StopIteration:
+                break
+        if not batches:
+            raise DatasetError(f"CSV file {path} appears to be empty")
+        sample = pa.Table.from_batches(batches).slice(0, min(sample_rows, n_read))
+    else:
+        # JSON / other formats are usually small — load fully
+        sample = _read_file(path, suffix)
+
+    schema = _infer_schema(sample, path.stem, tag_cardinality_threshold)
+    # Normalise timestamp so downstream adapters see consistent types
+    sample = normalize_timestamp_column(sample, schema.timestamp_col)
+    # Re-infer after normalisation to capture updated types
+    return _infer_schema(sample, path.stem, tag_cardinality_threshold)
+
+
 def apply_unit_conversions(
     table: pa.Table,
     conversions: dict[str, tuple[str, str]],

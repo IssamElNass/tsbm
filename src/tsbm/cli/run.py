@@ -43,7 +43,13 @@ from rich.table import Table
 from tsbm.adapters.registry import get_enabled_adapters
 from tsbm.benchmarks.registry import get_workload, list_workloads
 from tsbm.config.settings import get_settings, load_settings_from_file
-from tsbm.datasets.loader import apply_unit_conversions, load_dataset
+from tsbm.datasets.loader import (
+    apply_unit_conversions,
+    estimate_row_count,
+    infer_schema_from_sample,
+    load_dataset,
+    load_dataset_streaming,
+)
 from tsbm.environment.capture import capture_environment, enrich_db_versions
 from tsbm.exceptions import ConfigError
 from tsbm.metrics.monitor import ResourceMonitor
@@ -161,10 +167,31 @@ async def async_run(
     ).hexdigest()[:8]
 
     # ----------------------------------------------------------------
-    # 3. Dataset
+    # 3. Dataset — auto-switch to streaming for large files
     # ----------------------------------------------------------------
-    console.print(f"[cyan]Loading dataset:[/cyan] {effective_dataset}")
-    dataset = load_dataset(Path(effective_dataset))
+    effective_dataset_path = Path(effective_dataset)
+    console.print(f"[cyan]Loading dataset:[/cyan] {effective_dataset_path}")
+
+    n_rows_est = estimate_row_count(effective_dataset_path)
+    streaming_threshold = settings.workload.streaming_threshold_rows
+
+    if n_rows_est > streaming_threshold:
+        console.print(
+            f"  [dim]~{n_rows_est:,} rows > streaming threshold {streaming_threshold:,} "
+            f"— using streaming mode (chunk_size={settings.workload.chunk_size:,})[/dim]"
+        )
+        schema_hint = infer_schema_from_sample(
+            effective_dataset_path,
+            sample_rows=min(50_000, n_rows_est),
+            tag_cardinality_threshold=settings.workload.tag_cardinality_threshold,
+        )
+        dataset = load_dataset_streaming(
+            effective_dataset_path,
+            schema_hint=schema_hint,
+            chunk_size=settings.workload.chunk_size,
+        )
+    else:
+        dataset = load_dataset(effective_dataset_path)
 
     # Apply unit conversions if configured
     if settings.workload.unit_conversions and dataset.table is not None:
@@ -299,10 +326,16 @@ async def _run_adapters_for_workload(
 
                 # Query-only benchmarks need pre-existing data to produce
                 # meaningful results — ingest the full dataset before querying.
+                # In streaming mode, chunks are fed one at a time to avoid
+                # loading the whole dataset into RAM at once.
                 if workload_name in _QUERY_ONLY_BENCHMARKS:
                     progress.update(db_task, description=f"{task_desc} [dim]loading data…[/dim]")
-                    _tbl = dataset.load()
-                    await adapter.ingest_batch(_tbl, dataset.schema.name)
+                    if dataset.streaming:
+                        for _chunk in dataset.iter_batches():
+                            await adapter.ingest_batch(_chunk, dataset.schema.name)
+                    else:
+                        _tbl = dataset.load()
+                        await adapter.ingest_batch(_tbl, dataset.schema.name)
                     await adapter.flush()
 
                 # Start resource monitor

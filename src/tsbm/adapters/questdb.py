@@ -90,6 +90,12 @@ class QuestDBAdapter:
             self._pg_conn = None
             logger.debug("QuestDB: disconnected")
 
+    async def _ensure_connected(self) -> None:
+        """Reconnect the PGWire connection if the server closed it."""
+        if self._pg_conn is None or self._pg_conn.is_closed():
+            logger.warning("QuestDB: connection closed — reconnecting")
+            await self.connect()
+
     async def health_check(self) -> bool:
         try:
             await self._pg_conn.fetchval("SELECT 1")  # type: ignore[union-attr]
@@ -109,7 +115,7 @@ class QuestDBAdapter:
         # QuestDB's CREATE TABLE doesn't support IF NOT EXISTS — use WAL mode
         # Drop first to guarantee a clean state
         await self.drop_table(schema.name)
-        ddl = arrow_table_to_ddl(schema, DB_QUESTDB, schema.name)
+        ddl = arrow_table_to_ddl(schema, DB_QUESTDB, schema.name, self._config.partition_by)
         logger.debug("QuestDB DDL:\n%s", ddl)
         try:
             await self._pg_conn.execute(ddl)  # type: ignore[union-attr]
@@ -179,6 +185,7 @@ class QuestDBAdapter:
                 # sender.__exit__ calls flush() → HTTP POST completes here
             return result
 
+        await self._ensure_connected()
         try:
             return await asyncio.to_thread(_sync_send)
         except Exception as exc:
@@ -197,6 +204,7 @@ class QuestDBAdapter:
         sql: str,
         params: tuple = (),
     ) -> tuple[list[dict], TimingResult]:
+        await self._ensure_connected()
         try:
             with timed_operation() as result:
                 rows = await self._pg_conn.fetch(sql, *params)  # type: ignore[union-attr]

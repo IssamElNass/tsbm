@@ -86,6 +86,12 @@ class CrateDBAdapter:
             self._pg_conn = None
             logger.debug("CrateDB: disconnected")
 
+    async def _ensure_connected(self) -> None:
+        """Reconnect the PG-wire connection if the server closed it."""
+        if self._pg_conn is None or self._pg_conn.is_closed():
+            logger.warning("CrateDB: connection closed — reconnecting")
+            await self.connect()
+
     async def health_check(self) -> bool:
         try:
             await self._pg_conn.fetchval("SELECT 1")  # type: ignore[union-attr]
@@ -162,6 +168,7 @@ class CrateDBAdapter:
 
         params = [_col_to_list(table.column(c.name), c) for c in cols]
 
+        await self._ensure_connected()
         try:
             with timed_operation(rows=n_rows, bytes_count=n_bytes) as result:
                 await self._pg_conn.execute(sql, *params)  # type: ignore[union-attr]
@@ -193,6 +200,7 @@ class CrateDBAdapter:
         sql: str,
         params: tuple = (),
     ) -> tuple[list[dict], TimingResult]:
+        await self._ensure_connected()
         try:
             with timed_operation() as result:
                 rows = await self._pg_conn.fetch(sql, *params)  # type: ignore[union-attr]

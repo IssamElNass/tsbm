@@ -110,17 +110,22 @@ def _string_type(role: ColumnRole, db: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+_QUESTDB_PARTITION_VALUES = frozenset({"HOUR", "DAY", "WEEK", "MONTH", "YEAR"})
+
+
 def arrow_table_to_ddl(
     schema: DatasetSchema,
     db: str,
     table_name: str,
+    partition_by: str = "DAY",
 ) -> str:
     """
     Generate a ``CREATE TABLE`` statement for *db* from *schema*.
 
     Notes
     -----
-    * QuestDB    — appends ``TIMESTAMP(col) PARTITION BY DAY``
+    * QuestDB    — appends ``TIMESTAMP(col) PARTITION BY <partition_by>``.
+                   Valid values: HOUR, DAY, WEEK, MONTH, YEAR.
     * CrateDB    — plain CREATE TABLE (no partitioning; CrateDB's native
                    partitioning requires a generated column and is handled
                    separately if needed)
@@ -132,7 +137,13 @@ def arrow_table_to_ddl(
     col_defs = _column_definitions(schema, db)
 
     if db == DB_QUESTDB:
-        return _questdb_ddl(table_name, col_defs, schema.timestamp_col)
+        pb = partition_by.upper()
+        if pb not in _QUESTDB_PARTITION_VALUES:
+            raise ValueError(
+                f"Invalid QuestDB partition_by {partition_by!r}. "
+                f"Valid values: {sorted(_QUESTDB_PARTITION_VALUES)}"
+            )
+        return _questdb_ddl(table_name, col_defs, schema.timestamp_col, pb)
     if db == DB_CRATEDB:
         return _cratedb_ddl(table_name, col_defs)
     if db == DB_TIMESCALEDB:
@@ -158,12 +169,12 @@ def _column_definitions(schema: DatasetSchema, db: str) -> list[str]:
     return defs
 
 
-def _questdb_ddl(table_name: str, col_defs: list[str], ts_col: str) -> str:
+def _questdb_ddl(table_name: str, col_defs: list[str], ts_col: str, partition_by: str = "DAY") -> str:
     cols = ",\n".join(col_defs)
     return (
         f'CREATE TABLE IF NOT EXISTS "{table_name}" (\n'
         f"{cols}\n"
-        f") TIMESTAMP({ts_col}) PARTITION BY DAY;"
+        f") TIMESTAMP({ts_col}) PARTITION BY {partition_by};"
     )
 
 

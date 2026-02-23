@@ -34,6 +34,40 @@ from tsbm.results.models import OperationResult
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Column-selection helpers
+# ---------------------------------------------------------------------------
+
+
+def _pick_metric(schema: "DatasetSchema", config: Any) -> str:
+    """
+    Return the metric column to use for aggregations.
+
+    Checks ``config.agg_metric_col`` first; falls back to the first entry in
+    ``schema.metric_cols``.  This lets callers override the default via
+    ``benchmark.toml`` or an environment variable instead of always picking
+    column index 0 (which is often an ID-like column).
+    """
+    override = getattr(config, "agg_metric_col", None)
+    if override:
+        return override
+    return schema.metric_cols[0] if schema.metric_cols else "value"
+
+
+def _pick_tag(schema: "DatasetSchema", config: Any) -> str:
+    """
+    Return the tag column to use for GROUP BY / PARTITION BY queries.
+
+    Checks ``config.group_by_tag_col`` first; falls back to the first entry
+    in ``schema.tag_cols``.
+    """
+    override = getattr(config, "group_by_tag_col", None)
+    if override:
+        return override
+    return schema.tag_cols[0] if schema.tag_cols else "device_id"
+
+
 # Supported adapter names
 _DB_QUESTDB = "questdb"
 _DB_CRATEDB = "cratedb"
@@ -284,7 +318,7 @@ class AggregationBenchmark(_QueryBenchmarkBase):
     ) -> list[tuple[str, tuple]]:
         tbl = schema.name
         ts = schema.timestamp_col
-        metric = schema.metric_cols[0] if schema.metric_cols else "value"
+        metric = _pick_metric(schema, config)
         queries = []
 
         for start, end in windows:
@@ -361,8 +395,8 @@ class LastPointBenchmark(_QueryBenchmarkBase):
     ) -> list[tuple[str, tuple]]:
         tbl = schema.name
         ts = schema.timestamp_col
-        tag = schema.tag_cols[0] if schema.tag_cols else "device_id"
-        metric = schema.metric_cols[0] if schema.metric_cols else "value"
+        tag = _pick_tag(schema, config)
+        metric = _pick_metric(schema, config)
         queries = []
 
         for _ in windows:
@@ -430,8 +464,8 @@ class HighCardinalityBenchmark(_QueryBenchmarkBase):
     ) -> list[tuple[str, tuple]]:
         tbl = schema.name
         ts = schema.timestamp_col
-        tag = schema.tag_cols[0] if schema.tag_cols else "device_id"
-        metric = schema.metric_cols[0] if schema.metric_cols else "value"
+        tag = _pick_tag(schema, config)
+        metric = _pick_metric(schema, config)
         queries = []
 
         for start, end in windows:
@@ -502,7 +536,7 @@ class DownsamplingBenchmark(_QueryBenchmarkBase):
     ) -> list[tuple[str, tuple]]:
         tbl = schema.name
         ts = schema.timestamp_col
-        metric = schema.metric_cols[0] if schema.metric_cols else "value"
+        metric = _pick_metric(schema, config)
         queries = []
 
         for i, (start, end) in enumerate(windows):

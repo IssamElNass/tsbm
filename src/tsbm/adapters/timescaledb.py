@@ -79,6 +79,12 @@ class TimescaleDBAdapter:
             self._conn = None
             logger.debug("TimescaleDB: disconnected")
 
+    async def _ensure_connected(self) -> None:
+        """Reconnect the asyncpg connection if the server closed it."""
+        if self._conn is None or self._conn.is_closed():
+            logger.warning("TimescaleDB: connection closed — reconnecting")
+            await self.connect()
+
     async def health_check(self) -> bool:
         try:
             await self._conn.fetchval("SELECT 1")  # type: ignore[union-attr]
@@ -106,9 +112,11 @@ class TimescaleDBAdapter:
         try:
             await self._conn.execute(ddl)  # type: ignore[union-attr]
             await self._conn.execute(  # type: ignore[union-attr]
-                "SELECT create_hypertable($1, $2, if_not_exists => TRUE)",
+                "SELECT create_hypertable($1, $2, if_not_exists => TRUE, "
+                "chunk_time_interval => $3::INTERVAL)",
                 schema.name,
                 schema.timestamp_col,
+                self._config.chunk_time_interval,
             )
         except Exception as exc:
             raise QueryError(f"TimescaleDB create_table failed: {exc}") from exc
@@ -160,6 +168,7 @@ class TimescaleDBAdapter:
         columns = [c.name for c in schema.columns]
         records = _build_records(table, schema)
 
+        await self._ensure_connected()
         try:
             with timed_operation(rows=n_rows, bytes_count=n_bytes) as result:
                 await self._conn.copy_records_to_table(  # type: ignore[union-attr]
@@ -186,6 +195,7 @@ class TimescaleDBAdapter:
         sql: str,
         params: tuple = (),
     ) -> tuple[list[dict], TimingResult]:
+        await self._ensure_connected()
         try:
             with timed_operation() as result:
                 rows = await self._conn.fetch(sql, *params)  # type: ignore[union-attr]

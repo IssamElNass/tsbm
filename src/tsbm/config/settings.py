@@ -27,6 +27,11 @@ class QuestDBConfig(BaseModel):
     host: str = "localhost"
     ilp_port: int = 9000
     pg_port: int = 8812
+    # Table partitioning granularity. Valid values: HOUR, DAY, WEEK, MONTH, YEAR.
+    # Finer partitions improve query speed on short time ranges but create more
+    # file segments.  For 30 M+ rows spanning many days use HOUR; for sparse
+    # multi-year datasets use MONTH or YEAR.
+    partition_by: str = "DAY"
 
 
 class CrateDBConfig(BaseModel):
@@ -43,6 +48,11 @@ class TimescaleDBConfig(BaseModel):
     user: str = "postgres"
     password: str = "postgres"
     dbname: str = "tsbm"
+    # Hypertable chunk interval passed to create_hypertable().
+    # Smaller intervals = faster range queries on short windows but more chunks
+    # and higher metadata overhead.  Use "1 day" for high-frequency data
+    # (millions of rows/day) or "7 days" for sparser datasets.
+    chunk_time_interval: str = "7 days"
 
 
 class DatabasesConfig(BaseModel):
@@ -70,6 +80,12 @@ class WorkloadConfig(BaseModel):
     streaming_threshold_rows: int = 500_000  # auto-enable streaming above this row count
     chunk_size: int = 100_000               # rows per batch in streaming mode
     unit_conversions: dict[str, tuple[str, str]] = {}  # {"col": ("from_unit", "to_unit")}
+    # Column overrides for query benchmarks.
+    # By default every aggregation/GROUP BY uses the first metric/tag column in the
+    # dataset schema.  Set these to target a specific column instead — useful when
+    # the dataset has an ID-like column in position 0 that should not be aggregated.
+    agg_metric_col: str | None = None       # metric column for AVG/MIN/MAX; None → metric_cols[0]
+    group_by_tag_col: str | None = None     # tag column for GROUP BY / PARTITION BY; None → tag_cols[0]
     mv_granularity: str = "1 hour"          # time bucket granularity for MV benchmarks
     late_arrival_rounds: int = 10           # iterations for LateArrivalBenchmark
     late_arrival_batch_size: int = 100      # rows per late-arrival insertion

@@ -17,7 +17,6 @@
 ###############################################################################
 
 services:
-
   # ---------------------------------------------------------------------------
   # QuestDB
   # ---------------------------------------------------------------------------
@@ -26,8 +25,8 @@ services:
     container_name: tsbench_questdb
     restart: unless-stopped
     ports:
-      - "9000:9000"   # ILP HTTP + Web Console
-      - "8812:8812"   # PGWire
+      - "5001:9000" # ILP HTTP + Web Console
+      - "8812:8812" # PGWire
     environment:
       QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "1000000"
       QDB_SHARED_WORKER_COUNT: "2"
@@ -49,8 +48,8 @@ services:
     container_name: tsbench_cratedb
     restart: unless-stopped
     ports:
-      - "4200:4200"   # HTTP / Admin UI
-      - "5432:5432"   # PGWire
+      - "4200:4200" # HTTP / Admin UI
+      - "5432:5432" # PGWire
     environment:
       CRATE_HEAP_SIZE: "2g"
     command: >
@@ -60,7 +59,11 @@ services:
     volumes:
       - cratedb_data:/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:4200/_cluster/health || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://localhost:4200/_cluster/health || exit 1",
+        ]
       interval: 10s
       timeout: 5s
       retries: 15
@@ -74,11 +77,11 @@ services:
     container_name: tsbench_timescaledb
     restart: unless-stopped
     ports:
-      - "5433:5432"   # host 5433 → container 5432 (avoids CrateDB port conflict)
+      - "5433:5432" # host 5433 → container 5432 (avoids CrateDB port conflict)
     environment:
-      POSTGRES_USER:     postgres
+      POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB:       tsbm
+      POSTGRES_DB: tsbm
       # Tune shared_buffers and work_mem for benchmarking
       POSTGRES_INITDB_ARGS: "--encoding=UTF8"
     command: >
