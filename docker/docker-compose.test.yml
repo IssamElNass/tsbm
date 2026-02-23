@@ -1,0 +1,82 @@
+###############################################################################
+# TSBench — Test Docker Compose
+#
+# Ephemeral containers for integration tests.  No persistent volumes.
+# Containers are destroyed when the stack is torn down.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.test.yml up -d --wait
+#   pytest tests/integration/ -m integration -v
+#   docker compose -f docker/docker-compose.test.yml down
+#
+# The ``--wait`` flag (Compose v2.1+) blocks until all health-checks pass,
+# so there is no need for a separate wait script in CI.
+#
+# Port mappings match docker-compose.yml so benchmark.toml is reused as-is.
+###############################################################################
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # QuestDB (test)
+  # ---------------------------------------------------------------------------
+  questdb:
+    image: questdb/questdb:latest
+    container_name: tsbench_test_questdb
+    ports:
+      - "9000:9000"
+      - "8812:8812"
+    environment:
+      QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "100000"
+      QDB_SHARED_WORKER_COUNT: "1"
+      QDB_HTTP_ENABLED: "true"
+    # No volume — ephemeral for tests
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/ || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # CrateDB (test)
+  # ---------------------------------------------------------------------------
+  cratedb:
+    image: crate:latest
+    container_name: tsbench_test_cratedb
+    ports:
+      - "4200:4200"
+      - "5432:5432"
+    environment:
+      CRATE_HEAP_SIZE: "1g"
+    command: >
+      crate
+      -Cnetwork.host=0.0.0.0
+      -Cdiscovery.type=single-node
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4200/_cluster/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # TimescaleDB (test)
+  # ---------------------------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: tsbench_test_timescaledb
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB:       tsbench
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tsbench"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+# No named volumes — all containers use anonymous (ephemeral) storage

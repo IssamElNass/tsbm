@@ -1,0 +1,14 @@
+[datasets.small_iot]
+path             = "datasets/small_iot.csv"
+format           = "csv"
+description      = "Small IoT sensor dataset: 100 devices × 100 readings (deterministic, seed=42)"
+timestamp_col    = "timestamp"
+tag_cols         = ["device_id"]
+metric_cols      = ["temperature", "humidity", "voltage", "pressure"]
+row_count        = 10000
+time_range_start = "2024-01-01T00:00:00Z"
+time_range_end   = "2024-01-01T23:59:59Z"
+generator        = "iot"
+generator_seed   = 42
+n_devices        = 100
+n_readings       = 100

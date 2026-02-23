@@ -1,0 +1,43 @@
+[databases.questdb]
+enabled   = true
+host      = "localhost"
+ilp_port  = 9000
+pg_port   = 8812
+
+[databases.cratedb]
+enabled   = true
+host      = "localhost"
+http_port = 4200
+pg_port   = 5432
+
+[databases.timescaledb]
+enabled   = true
+host      = "localhost"
+pg_port   = 5433          # host-mapped port (Docker maps 5433→5432 to avoid CrateDB conflict)
+user      = "postgres"
+password  = "postgres"
+dbname    = "tsbm"
+
+[workload]
+dataset              = "datasets/small_iot.csv"
+batch_sizes          = [1000, 5000, 10000, 50000]
+workers              = [1, 4, 8, 16]
+warmup_iterations    = 5
+measurement_rounds   = 30
+time_windows         = ["1min", "1h", "1day", "1week"]
+prng_seed            = 42
+mixed_duration_seconds = 60
+reset_between_rounds = false
+streaming_threshold_rows = 500000
+chunk_size               = 100000
+mv_granularity           = "1 hour"
+late_arrival_rounds      = 10
+late_arrival_batch_size  = 100
+
+[results]
+sqlite_path = "results/runs.db"
+parquet_dir = "results/parquet"
+
+[monitor]
+enabled     = true
+interval_ms = 500

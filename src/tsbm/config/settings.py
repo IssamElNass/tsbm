@@ -1,0 +1,175 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib  # type: ignore[no-redef]
+
+from pydantic import BaseModel
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
+
+
+# ---------------------------------------------------------------------------
+# Per-database config models
+# ---------------------------------------------------------------------------
+
+
+class QuestDBConfig(BaseModel):
+    enabled: bool = True
+    host: str = "localhost"
+    ilp_port: int = 9000
+    pg_port: int = 8812
+
+
+class CrateDBConfig(BaseModel):
+    enabled: bool = True
+    host: str = "localhost"
+    http_port: int = 4200
+    pg_port: int = 5432
+
+
+class TimescaleDBConfig(BaseModel):
+    enabled: bool = True
+    host: str = "localhost"
+    pg_port: int = 5433  # Docker host port (maps 5433→5432, avoids CrateDB conflict)
+    user: str = "postgres"
+    password: str = "postgres"
+    dbname: str = "tsbm"
+
+
+class DatabasesConfig(BaseModel):
+    questdb: QuestDBConfig = QuestDBConfig()
+    cratedb: CrateDBConfig = CrateDBConfig()
+    timescaledb: TimescaleDBConfig = TimescaleDBConfig()
+
+
+# ---------------------------------------------------------------------------
+# Workload config
+# ---------------------------------------------------------------------------
+
+
+class WorkloadConfig(BaseModel):
+    dataset: Path = Path("datasets/small_iot.csv")
+    batch_sizes: list[int] = [1000, 5000, 10000, 50000]
+    workers: list[int] = [1, 4, 8, 16]
+    warmup_iterations: int = 5
+    measurement_rounds: int = 30
+    time_windows: list[str] = ["1min", "1h", "1day", "1week"]
+    prng_seed: int = 42
+    mixed_duration_seconds: int = 60
+    reset_between_rounds: bool = False
+    tag_cardinality_threshold: float = 0.05  # fraction of rows; below → TAG column
+    streaming_threshold_rows: int = 500_000  # auto-enable streaming above this row count
+    chunk_size: int = 100_000               # rows per batch in streaming mode
+    unit_conversions: dict[str, tuple[str, str]] = {}  # {"col": ("from_unit", "to_unit")}
+    mv_granularity: str = "1 hour"          # time bucket granularity for MV benchmarks
+    late_arrival_rounds: int = 10           # iterations for LateArrivalBenchmark
+    late_arrival_batch_size: int = 100      # rows per late-arrival insertion
+
+
+# ---------------------------------------------------------------------------
+# Results config
+# ---------------------------------------------------------------------------
+
+
+class ResultsConfig(BaseModel):
+    sqlite_path: Path = Path("results/runs.db")
+    parquet_dir: Path = Path("results/parquet")
+
+
+# ---------------------------------------------------------------------------
+# Monitor config
+# ---------------------------------------------------------------------------
+
+
+class MonitorConfig(BaseModel):
+    enabled: bool = True
+    interval_ms: int = 500
+
+
+# ---------------------------------------------------------------------------
+# Top-level settings
+# ---------------------------------------------------------------------------
+
+
+_TOML_CONFIG_PATH = Path("benchmark.toml")
+
+
+class Settings(BaseSettings):
+    """
+    Reads configuration from (in priority order, highest first):
+      1. Environment variables prefixed with TSBM_ (e.g. TSBM_DATABASES__QUESTDB__HOST)
+      2. benchmark.toml in the current working directory
+      3. Hard-coded defaults above
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="TSBM_",
+        env_nested_delimiter="__",
+        # Do not raise on extra fields from TOML that aren't in the model
+        extra="ignore",
+    )
+
+    databases: DatabasesConfig = DatabasesConfig()
+    workload: WorkloadConfig = WorkloadConfig()
+    results: ResultsConfig = ResultsConfig()
+    monitor: MonitorConfig = MonitorConfig()
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        sources: list[PydanticBaseSettingsSource] = [
+            init_settings,
+            env_settings,
+        ]
+        if _TOML_CONFIG_PATH.exists():
+            sources.append(TomlConfigSettingsSource(settings_cls, toml_file=_TOML_CONFIG_PATH))
+        return tuple(sources)
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+
+_settings: Settings | None = None
+
+
+def get_settings() -> Settings:
+    """Return the cached Settings singleton, creating it on first call."""
+    global _settings
+    if _settings is None:
+        _settings = Settings()
+    return _settings
+
+
+def reset_settings() -> None:
+    """Clear the cached singleton (useful in tests that need fresh config)."""
+    global _settings
+    _settings = None
+
+
+def load_settings_from_file(path: Path) -> Settings:
+    """Load settings from an explicit TOML path (bypasses CWD lookup)."""
+    global _TOML_CONFIG_PATH
+    original = _TOML_CONFIG_PATH
+    _TOML_CONFIG_PATH = path
+    reset_settings()
+    try:
+        return get_settings()
+    finally:
+        _TOML_CONFIG_PATH = original
+        reset_settings()

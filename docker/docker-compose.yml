@@ -1,0 +1,108 @@
+###############################################################################
+# TSBench — Production Docker Compose
+#
+# Starts QuestDB, CrateDB, and TimescaleDB with persistent volumes.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.yml up -d
+#   docker compose -f docker/docker-compose.yml down          # keep data
+#   docker compose -f docker/docker-compose.yml down -v       # wipe data
+#
+# Port mappings (host:container):
+#   QuestDB:     9000:9000  (ILP HTTP + Web Console)
+#                8812:8812  (PGWire)
+#   CrateDB:     4200:4200  (HTTP / Admin UI)
+#                5432:5432  (PGWire)
+#   TimescaleDB: 5433:5432  (host 5433 avoids CrateDB conflict on 5432)
+###############################################################################
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # QuestDB
+  # ---------------------------------------------------------------------------
+  questdb:
+    image: questdb/questdb:latest
+    container_name: tsbench_questdb
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # ILP HTTP + Web Console
+      - "8812:8812"   # PGWire
+    environment:
+      QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "1000000"
+      QDB_SHARED_WORKER_COUNT: "2"
+      QDB_HTTP_ENABLED: "true"
+    volumes:
+      - questdb_data:/var/lib/questdb
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # CrateDB
+  # ---------------------------------------------------------------------------
+  cratedb:
+    image: crate:latest
+    container_name: tsbench_cratedb
+    restart: unless-stopped
+    ports:
+      - "4200:4200"   # HTTP / Admin UI
+      - "5432:5432"   # PGWire
+    environment:
+      CRATE_HEAP_SIZE: "2g"
+    command: >
+      crate
+      -Cnetwork.host=0.0.0.0
+      -Cdiscovery.type=single-node
+    volumes:
+      - cratedb_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # TimescaleDB
+  # ---------------------------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: tsbench_timescaledb
+    restart: unless-stopped
+    ports:
+      - "5433:5432"   # host 5433 → container 5432 (avoids CrateDB port conflict)
+    environment:
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB:       tsbm
+      # Tune shared_buffers and work_mem for benchmarking
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    command: >
+      postgres
+      -c shared_buffers=512MB
+      -c work_mem=64MB
+      -c maintenance_work_mem=256MB
+      -c effective_cache_size=1GB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c synchronous_commit=off
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tsbm"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+volumes:
+  questdb_data:
+    name: tsbench_questdb_data
+  cratedb_data:
+    name: tsbench_cratedb_data
+  timescaledb_data:
+    name: tsbench_timescaledb_data

@@ -1,0 +1,86 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ── Type checking / linting ───────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pytype/
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.coveragerc
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Build tooling ─────────────────────────────────────────────────────────────
+.hatch/
+*.whl
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── tsbm — Results ────────────────────────────────────────────────────────────
+# Keep the directory skeleton tracked via .gitkeep; ignore generated content.
+results/runs.db
+results/parquet/*
+!results/parquet/.gitkeep
+results/*.db
+results/*.json
+
+# ── tsbm — Datasets ───────────────────────────────────────────────────────────
+# Track the small sample dataset; ignore large generated / user-supplied files.
+datasets/*.parquet
+datasets/*.parq
+datasets/large*.csv
+datasets/generated*.csv
+# Keep: datasets/small_iot.csv and datasets/dataset_manifest.toml
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+docker-compose.override.yml
+docker/.env
+
+# ── Secrets / local config overrides ─────────────────────────────────────────
+*.local.toml
+.env.*
+secrets/

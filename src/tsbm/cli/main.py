@@ -1,0 +1,208 @@
+"""
+tsbm — Time-Series Database Benchmark Suite CLI.
+
+Entry point: ``tsbm`` (defined in pyproject.toml).
+
+Commands
+--------
+  run        Run a benchmark workload against one or more databases.
+  generate   Generate a synthetic IoT dataset and write it to Parquet/CSV.
+  load       Ingest a dataset into a database without benchmarking.
+  compare    Compare results from two or more runs.
+  dashboard  Launch the Streamlit results dashboard.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+from pathlib import Path
+from typing import List, Optional
+
+import typer
+from rich.console import Console
+from typing_extensions import Annotated
+
+from tsbm.cli.run import async_run, async_generate, async_load
+from tsbm.cli.compare import async_compare
+from tsbm.cli.dashboard import launch_dashboard
+
+app = typer.Typer(
+    name="tsbm",
+    help="Time-Series Database Benchmark Suite",
+    add_completion=False,
+    rich_markup_mode="rich",
+)
+console = Console()
+
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+
+
+@app.command("run")
+def cmd_run(
+    db: Annotated[
+        Optional[List[str]],
+        typer.Option("--db", "-d", help="Database(s) to target. Repeat for multiple. Default: all enabled."),
+    ] = None,
+    benchmark: Annotated[
+        str,
+        typer.Option("--benchmark", "-b", help="Workload name (ingestion, time_range, aggregation, last_point, high_cardinality, downsampling, mixed, ingestion_out_of_order)."),
+    ] = "ingestion",
+    config: Annotated[
+        Optional[Path],
+        typer.Option("--config", "-c", help="Path to benchmark.toml. Defaults to ./benchmark.toml."),
+    ] = None,
+    dataset: Annotated[
+        Optional[Path],
+        typer.Option("--dataset", help="Override dataset path from config."),
+    ] = None,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Enable debug logging."),
+    ] = False,
+) -> None:
+    """Run a benchmark workload against one or more databases."""
+    _setup_logging(verbose)
+    asyncio.run(async_run(
+        db_names=list(db) if db else None,
+        benchmark_name=benchmark,
+        config_path=config,
+        dataset_path=dataset,
+    ))
+
+
+# ---------------------------------------------------------------------------
+# generate
+# ---------------------------------------------------------------------------
+
+
+@app.command("generate")
+def cmd_generate(
+    devices: Annotated[int, typer.Option("--devices", "-n", help="Number of unique devices.")] = 100,
+    readings: Annotated[int, typer.Option("--readings", "-r", help="Readings per device.")] = 1000,
+    seed: Annotated[int, typer.Option("--seed", help="PRNG seed for reproducibility.")] = 42,
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Output file path (.parquet or .csv)."),
+    ] = Path("datasets/generated.parquet"),
+) -> None:
+    """Generate a synthetic IoT dataset and write it to a file."""
+    asyncio.run(async_generate(
+        n_devices=devices,
+        n_readings=readings,
+        seed=seed,
+        output_path=output,
+    ))
+
+
+# ---------------------------------------------------------------------------
+# load
+# ---------------------------------------------------------------------------
+
+
+@app.command("load")
+def cmd_load(
+    db: Annotated[
+        Optional[List[str]],
+        typer.Option("--db", "-d", help="Database(s) to load into. Repeat for multiple."),
+    ] = None,
+    dataset: Annotated[
+        Optional[Path],
+        typer.Option("--dataset", help="Dataset file to load (.csv, .parquet, .json)."),
+    ] = None,
+    config: Annotated[
+        Optional[Path],
+        typer.Option("--config", "-c", help="Path to benchmark.toml."),
+    ] = None,
+    drop: Annotated[
+        bool,
+        typer.Option("--drop/--no-drop", help="Drop existing table before loading."),
+    ] = True,
+) -> None:
+    """Ingest a dataset into a database without benchmarking."""
+    asyncio.run(async_load(
+        db_names=list(db) if db else None,
+        dataset_path=dataset,
+        config_path=config,
+        drop_first=drop,
+    ))
+
+
+# ---------------------------------------------------------------------------
+# compare
+# ---------------------------------------------------------------------------
+
+
+@app.command("compare")
+def cmd_compare(
+    run_ids: Annotated[
+        List[str],
+        typer.Argument(help="Run IDs to compare (space-separated)."),
+    ],
+    operation: Annotated[
+        Optional[str],
+        typer.Option("--operation", "-o", help="Filter to a specific operation."),
+    ] = None,
+    metric: Annotated[
+        str,
+        typer.Option("--metric", "-m", help="Metric column to highlight."),
+    ] = "latency_p99_ms",
+    format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format: table | csv | json | markdown."),
+    ] = "table",
+    output: Annotated[
+        Optional[Path],
+        typer.Option("--output", help="Write results to file instead of stdout."),
+    ] = None,
+    config: Annotated[
+        Optional[Path],
+        typer.Option("--config", "-c", help="Path to benchmark.toml (for results DB path)."),
+    ] = None,
+) -> None:
+    """Compare results from one or more benchmark runs."""
+    asyncio.run(async_compare(
+        run_ids=run_ids,
+        operation=operation,
+        metric=metric,
+        fmt=format,
+        output=output,
+        config_path=config,
+    ))
+
+
+# ---------------------------------------------------------------------------
+# dashboard
+# ---------------------------------------------------------------------------
+
+
+@app.command("dashboard")
+def cmd_dashboard(
+    port: Annotated[int, typer.Option("--port", "-p", help="Streamlit server port.")] = 8501,
+    results_db: Annotated[
+        Optional[Path],
+        typer.Option("--results-db", help="Path to results SQLite database."),
+    ] = None,
+    config: Annotated[
+        Optional[Path],
+        typer.Option("--config", "-c", help="Path to benchmark.toml."),
+    ] = None,
+) -> None:
+    """Launch the Streamlit results dashboard."""
+    launch_dashboard(port=port, results_db=results_db, config_path=config)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _setup_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.WARNING
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+        level=level,
+    )
