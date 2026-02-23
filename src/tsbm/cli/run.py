@@ -6,24 +6,29 @@ run orchestration
 1. Load config (from explicit path or default benchmark.toml)
 2. Capture environment snapshot
 3. Load / prepare dataset
-4. For each enabled adapter:
-   a. Connect, get version, create table
-   b. Start ResourceMonitor (if enabled)
-   c. Run the selected benchmark workload
-   d. Stop monitor; attach ResourceSummary to each BenchmarkSummary
-   e. Save RunConfig, OperationResults, BenchmarkSummaries to storage
-   f. Disconnect
-5. Print Rich summary table
+4. For each benchmark (one or all):
+   a. For each enabled adapter:
+      i.  Connect, get version, create table
+      ii. Pre-populate data for query-only benchmarks
+      iii.Start ResourceMonitor (if enabled)
+      iv. Run the selected benchmark workload
+      v.  Stop monitor; attach ResourceSummary to each BenchmarkSummary
+      vi. Save RunConfig, OperationResults, BenchmarkSummaries to storage
+      vii.Disconnect
+   b. Print Rich summary table with description and verdict for that benchmark
+5. Print all run IDs
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
+from itertools import groupby
 from pathlib import Path
 from typing import Any
 
 from rich.console import Console
+from rich.panel import Panel
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -50,6 +55,70 @@ console = Console()
 
 
 # ---------------------------------------------------------------------------
+# Benchmark metadata
+# ---------------------------------------------------------------------------
+
+_BENCHMARK_DESCRIPTIONS: dict[str, str] = {
+    "ingestion": (
+        "Measures raw write throughput at varying batch sizes and worker counts. "
+        "Higher Rows/sec = better write performance. Critical for high-velocity IoT ingestion."
+    ),
+    "ingestion_out_of_order": (
+        "Same as ingestion but timestamps are shuffled before insert. "
+        "Reveals overhead for out-of-order writes and whether the database reorders efficiently."
+    ),
+    "time_range": (
+        "Scans a random time window using a WHERE clause. "
+        "Lower p99 latency = more predictable response times for dashboards and alerting."
+    ),
+    "aggregation": (
+        "GROUP BY time-bucket aggregations (avg/min/max per hour). "
+        "The most common time-series pattern — lower p99 indicates efficient aggregate pushdown."
+    ),
+    "last_point": (
+        "Fetches the most recent value per device/tag. "
+        "Tests LATEST BY / DISTINCT ON optimisation — critical for IoT status dashboards."
+    ),
+    "high_cardinality": (
+        "GROUP BY on a tag column with 10,000+ unique values. "
+        "Exposes cardinality bottlenecks that severely degrade performance in many systems."
+    ),
+    "downsampling": (
+        "Multi-resolution aggregation across 1-min, 1-hour, and 1-day windows. "
+        "Simulates reducing raw samples for long-term storage and trend analysis."
+    ),
+    "mixed": (
+        "Concurrent read and write workload running simultaneously. "
+        "Reflects real production load — high latency or low throughput here signals contention."
+    ),
+    "materialized_view": (
+        "Compares raw aggregation speed versus a pre-computed materialized view / continuous aggregate. "
+        "A large speedup ratio shows effective MV support; a small gain means overhead dominates."
+    ),
+    "late_arrival": (
+        "Measures cost of inserting out-of-order data when materialized views are active. "
+        "Low recompute overhead = efficient incremental MV refresh."
+    ),
+}
+
+# Benchmarks where higher Rows/sec is the primary success metric
+_THROUGHPUT_BENCHMARKS: frozenset[str] = frozenset({
+    "ingestion",
+    "ingestion_out_of_order",
+    "mixed",
+})
+
+# Benchmarks that query existing data and do not populate the table themselves
+_QUERY_ONLY_BENCHMARKS: frozenset[str] = frozenset({
+    "time_range",
+    "aggregation",
+    "last_point",
+    "high_cardinality",
+    "downsampling",
+})
+
+
+# ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
 
@@ -70,13 +139,17 @@ async def async_run(
     else:
         settings = get_settings()
 
-    if benchmark_name not in list_workloads():
-        raise ConfigError(
-            f"Unknown benchmark {benchmark_name!r}. "
-            f"Available: {', '.join(list_workloads())}"
-        )
+    known = list_workloads()
+    if benchmark_name == "all":
+        workload_names = known
+    else:
+        if benchmark_name not in known:
+            raise ConfigError(
+                f"Unknown benchmark {benchmark_name!r}. "
+                f"Available: {', '.join(known)}, all"
+            )
+        workload_names = [benchmark_name]
 
-    workload = get_workload(benchmark_name)
     effective_dataset = dataset_path or settings.workload.dataset
 
     # ----------------------------------------------------------------
@@ -126,11 +199,64 @@ async def async_run(
         console.print("[red]No adapters available. Check --db and your config.[/red]")
         return
 
-    console.print(
-        f"\n[bold]Benchmark:[/bold] {benchmark_name}  "
-        f"[bold]Databases:[/bold] {', '.join(a.name for a in adapters)}\n"
-    )
+    if len(workload_names) > 1:
+        console.print(
+            f"\n[bold]Running {len(workload_names)} benchmarks:[/bold] "
+            f"{', '.join(workload_names)}  "
+            f"[bold]Databases:[/bold] {', '.join(a.name for a in adapters)}\n"
+        )
+    else:
+        console.print(
+            f"\n[bold]Benchmark:[/bold] {workload_names[0]}  "
+            f"[bold]Databases:[/bold] {', '.join(a.name for a in adapters)}\n"
+        )
 
+    # ----------------------------------------------------------------
+    # 6. Run each benchmark
+    # ----------------------------------------------------------------
+    all_run_ids: list[str] = []
+
+    for bench_idx, wl_name in enumerate(workload_names, 1):
+        if len(workload_names) > 1:
+            console.print(
+                f"\n[bold cyan]({bench_idx}/{len(workload_names)}) {wl_name}[/bold cyan]"
+            )
+
+        workload = get_workload(wl_name)
+        run_ids = await _run_adapters_for_workload(
+            workload=workload,
+            workload_name=wl_name,
+            adapters=adapters,
+            dataset=dataset,
+            settings=settings,
+            storage=storage,
+            env=env,
+            config_hash=config_hash,
+        )
+        all_run_ids.extend(run_ids)
+
+        # Per-benchmark summary
+        summaries = storage.load_summaries(run_ids=run_ids)
+        if summaries:
+            console.print()
+            _print_summary_table(summaries, wl_name)
+        console.print(f"[dim]Run IDs ({wl_name}): {', '.join(run_ids)}[/dim]")
+
+    if len(workload_names) > 1:
+        console.print(f"\n[dim]All run IDs: {', '.join(all_run_ids)}[/dim]")
+
+
+async def _run_adapters_for_workload(
+    workload: Any,
+    workload_name: str,
+    adapters: list[Any],
+    dataset: Any,
+    settings: Any,
+    storage: ResultStorage,
+    env: dict[str, Any],
+    config_hash: str,
+) -> list[str]:
+    """Run *workload* against every adapter; return the list of run_ids created."""
     all_run_ids: list[str] = []
 
     with Progress(
@@ -142,7 +268,7 @@ async def async_run(
         console=console,
     ) as progress:
         outer = progress.add_task(
-            f"[bold white]{benchmark_name}", total=len(adapters)
+            f"[bold white]{workload_name}", total=len(adapters)
         )
 
         for adapter in adapters:
@@ -150,7 +276,7 @@ async def async_run(
             db_task: TaskID = progress.add_task(task_desc, total=None)
 
             run = RunConfig(
-                benchmark_name=benchmark_name,
+                benchmark_name=workload_name,
                 database_name=adapter.name,
                 dataset_name=dataset.schema.name,
                 config_hash=config_hash,
@@ -170,6 +296,14 @@ async def async_run(
                 progress.update(db_task, description=f"{task_desc} [dim]creating table…[/dim]")
                 await adapter.drop_table(dataset.schema.name)
                 await adapter.create_table(dataset.schema)
+
+                # Query-only benchmarks need pre-existing data to produce
+                # meaningful results — ingest the full dataset before querying.
+                if workload_name in _QUERY_ONLY_BENCHMARKS:
+                    progress.update(db_task, description=f"{task_desc} [dim]loading data…[/dim]")
+                    _tbl = dataset.load()
+                    await adapter.ingest_batch(_tbl, dataset.schema.name)
+                    await adapter.flush()
 
                 # Start resource monitor
                 monitor: ResourceMonitor | None = None
@@ -222,14 +356,7 @@ async def async_run(
 
             progress.advance(outer)
 
-    # ----------------------------------------------------------------
-    # 6. Summary table
-    # ----------------------------------------------------------------
-    console.print()
-    summaries = storage.load_summaries(run_ids=all_run_ids)
-    if summaries:
-        _print_summary_table(summaries, benchmark_name)
-    console.print(f"\n[dim]Run IDs: {', '.join(all_run_ids)}[/dim]")
+    return all_run_ids
 
 
 # ---------------------------------------------------------------------------
@@ -340,26 +467,107 @@ async def async_load(
 
 
 # ---------------------------------------------------------------------------
-# Rich summary table
+# Rich summary table helpers
 # ---------------------------------------------------------------------------
 
 
+def _assign_verdicts(summaries: list[dict[str, Any]], benchmark_name: str) -> dict[int, str]:
+    """
+    Return a mapping of row-index → Rich-formatted verdict string.
+
+    When multiple databases appear for the same (operation, batch_size, workers)
+    combination the verdict is relative (Best / Mid / Worst).  For a single
+    database an absolute threshold is used instead.
+    """
+    is_throughput = benchmark_name in _THROUGHPUT_BENCHMARKS
+    verdicts: dict[int, str] = {}
+
+    def _group_key(item: tuple[int, dict]) -> tuple:
+        r = item[1]
+        return (r.get("operation", ""), r.get("batch_size", 0), r.get("workers", 1))
+
+    indexed = list(enumerate(summaries))
+    sorted_items = sorted(indexed, key=_group_key)
+
+    for _, group_iter in groupby(sorted_items, key=_group_key):
+        group = list(group_iter)
+
+        if len(group) == 1:
+            idx, row = group[0]
+            if is_throughput:
+                rps = row.get("rows_per_second_mean", 0) or 0
+                if rps >= 500_000:
+                    verdicts[idx] = "[green]Excellent[/green]"
+                elif rps >= 100_000:
+                    verdicts[idx] = "[green]Good[/green]"
+                elif rps >= 20_000:
+                    verdicts[idx] = "[yellow]Acceptable[/yellow]"
+                else:
+                    verdicts[idx] = "[red]Poor[/red]"
+            else:
+                p99 = row.get("latency_p99_ms", 0) or 0
+                if p99 <= 5:
+                    verdicts[idx] = "[green]Excellent[/green]"
+                elif p99 <= 50:
+                    verdicts[idx] = "[green]Good[/green]"
+                elif p99 <= 500:
+                    verdicts[idx] = "[yellow]Acceptable[/yellow]"
+                else:
+                    verdicts[idx] = "[red]Poor[/red]"
+        else:
+            # Relative ranking within this group
+            if is_throughput:
+                ranked = sorted(
+                    group,
+                    key=lambda x: x[1].get("rows_per_second_mean", 0) or 0,
+                    reverse=True,
+                )
+            else:
+                ranked = sorted(
+                    group,
+                    key=lambda x: x[1].get("latency_p99_ms", float("inf")) or float("inf"),
+                )
+            for rank, (idx, _) in enumerate(ranked):
+                if rank == 0:
+                    verdicts[idx] = "[green]Best[/green]"
+                elif rank == len(ranked) - 1:
+                    verdicts[idx] = "[red]Worst[/red]"
+                else:
+                    verdicts[idx] = "[yellow]Mid[/yellow]"
+
+    return verdicts
+
+
 def _print_summary_table(summaries: list[dict[str, Any]], benchmark_name: str) -> None:
+    # Description panel
+    desc = _BENCHMARK_DESCRIPTIONS.get(benchmark_name)
+    if desc:
+        console.print(
+            Panel(
+                f"[bold]{benchmark_name}[/bold]\n[dim]{desc}[/dim]",
+                border_style="blue",
+                padding=(0, 1),
+            )
+        )
+
+    verdicts = _assign_verdicts(summaries, benchmark_name)
+
     table = Table(
-        title=f"Benchmark Results — [bold]{benchmark_name}[/bold]",
+        title=f"Results — [bold]{benchmark_name}[/bold]",
         show_header=True,
         header_style="bold magenta",
     )
-    table.add_column("Database",     style="cyan",    no_wrap=True)
-    table.add_column("Operation",    style="white")
-    table.add_column("Batch",        justify="right")
-    table.add_column("Workers",      justify="right")
-    table.add_column("p50 ms",       justify="right", style="green")
-    table.add_column("p99 ms",       justify="right", style="yellow")
-    table.add_column("Rows/sec",     justify="right", style="bold white")
-    table.add_column("Samples",      justify="right", style="dim")
+    table.add_column("Database",  style="cyan",    no_wrap=True)
+    table.add_column("Operation", style="white")
+    table.add_column("Batch",     justify="right")
+    table.add_column("Workers",   justify="right")
+    table.add_column("p50 ms",    justify="right", style="green")
+    table.add_column("p99 ms",    justify="right", style="yellow")
+    table.add_column("Rows/sec",  justify="right", style="bold white")
+    table.add_column("Samples",   justify="right", style="dim")
+    table.add_column("Verdict",   justify="center")
 
-    for row in summaries:
+    for i, row in enumerate(summaries):
         if row.get("latency_p50_ms") is None:
             continue
         rps = row.get("rows_per_second_mean", 0)
@@ -372,6 +580,72 @@ def _print_summary_table(summaries: list[dict[str, Any]], benchmark_name: str) -
             f"{row.get('latency_p99_ms', 0):.2f}",
             f"{rps:,.0f}" if rps else "—",
             str(row.get("sample_count", 0)),
+            verdicts.get(i, ""),
         )
 
     console.print(table)
+    _print_interpretation(summaries, benchmark_name)
+
+
+def _print_interpretation(summaries: list[dict[str, Any]], benchmark_name: str) -> None:
+    """Print a human-readable interpretation panel below the results table."""
+    is_throughput = benchmark_name in _THROUGHPUT_BENCHMARKS
+    lines: list[str] = []
+
+    # Group rows by operation (there may be several for multi-param benchmarks)
+    ops: dict[str, list[dict]] = {}
+    for row in summaries:
+        op = row.get("operation", benchmark_name)
+        ops.setdefault(op, []).append(row)
+
+    for rows in ops.values():
+        valid = [r for r in rows if r.get("latency_p50_ms") is not None]
+        if not valid:
+            continue
+
+        if is_throughput:
+            best = max(valid, key=lambda r: r.get("rows_per_second_mean", 0) or 0)
+            worst = min(valid, key=lambda r: r.get("rows_per_second_mean", 0) or 0)
+            best_rps = best.get("rows_per_second_mean", 0) or 0
+            worst_rps = worst.get("rows_per_second_mean", 0) or 0
+
+            if len(valid) > 1:
+                ratio = f" ({best_rps / worst_rps:.1f}× faster)" if worst_rps > 0 else ""
+                lines.append(
+                    f"[green]↑[/green] [bold]{best['database_name']}[/bold] leads at "
+                    f"[bold]{best_rps:,.0f}[/bold] rows/sec; "
+                    f"[bold]{worst['database_name']}[/bold] trails at "
+                    f"[bold]{worst_rps:,.0f}[/bold] rows/sec{ratio}."
+                )
+            else:
+                icon = "[green]↑[/green]" if best_rps >= 100_000 else "[yellow]~[/yellow]" if best_rps >= 20_000 else "[red]↓[/red]"
+                label = "Excellent" if best_rps >= 500_000 else "Good" if best_rps >= 100_000 else "Acceptable" if best_rps >= 20_000 else "Poor"
+                lines.append(f"{icon} Throughput: [bold]{best_rps:,.0f}[/bold] rows/sec — {label}.")
+        else:
+            best = min(valid, key=lambda r: r.get("latency_p99_ms", float("inf")) or float("inf"))
+            worst = max(valid, key=lambda r: r.get("latency_p99_ms", 0) or 0)
+            best_p99 = best.get("latency_p99_ms", 0) or 0
+            worst_p99 = worst.get("latency_p99_ms", 0) or 0
+
+            if len(valid) > 1:
+                ratio = f" ({worst_p99 / best_p99:.1f}× slower)" if best_p99 > 0 else ""
+                lines.append(
+                    f"[green]↓[/green] Best p99: [bold]{best['database_name']}[/bold] at "
+                    f"[bold]{best_p99:.1f} ms[/bold]; "
+                    f"[bold]{worst['database_name']}[/bold] at "
+                    f"[bold]{worst_p99:.1f} ms[/bold]{ratio}."
+                )
+            else:
+                icon = "[green]↓[/green]" if best_p99 <= 50 else "[yellow]~[/yellow]" if best_p99 <= 500 else "[red]↑[/red]"
+                label = "Excellent" if best_p99 <= 5 else "Good" if best_p99 <= 50 else "Acceptable" if best_p99 <= 500 else "Poor"
+                lines.append(f"{icon} p99 latency: [bold]{best_p99:.1f} ms[/bold] — {label}.")
+
+    if lines:
+        console.print(
+            Panel(
+                "\n".join(lines),
+                title="[bold]Interpretation[/bold]",
+                border_style="dim",
+                padding=(0, 1),
+            )
+        )

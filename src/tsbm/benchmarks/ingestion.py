@@ -105,6 +105,28 @@ class IngestionBenchmark:
                             adapter.name, batch_size, workers, i, exc,
                         )
 
+                # ---- Optional pre-seed ----
+                # Insert seed rows after the last warmup (which leaves a clean
+                # table) so measurement rounds start against a pre-populated
+                # table — useful for testing append-into-existing-data latency.
+                # Has no effect when reset_between_rounds = true (the first
+                # measurement round will drop and recreate the table anyway).
+                seed_n = getattr(config, "ingestion_seed_rows", 0)
+                if seed_n > 0:
+                    seed_batch = table.slice(0, min(seed_n, len(table)))
+                    try:
+                        await adapter.ingest_batch(seed_batch, table_name)
+                        await adapter.flush()
+                        logger.info(
+                            "Pre-seeded %d rows (batch_size=%d workers=%d)",
+                            len(seed_batch), batch_size, workers,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Pre-seed error (batch_size=%d workers=%d): %s",
+                            batch_size, workers, exc,
+                        )
+
                 # ---- Measurement ----
                 measurement_timings: list[TimingResult] = []
                 for i in range(config.measurement_rounds):
@@ -191,6 +213,25 @@ class IngestionBenchmark:
                     )
             except Exception as exc:
                 logger.warning("Streaming warmup error (iter=%d): %s", i, exc)
+
+        # ---- Optional pre-seed (streaming mode) ----
+        # Stream chunks from the dataset file until seed_n rows have been
+        # inserted, then stop.  Same semantics as the eager-mode seed.
+        seed_n = getattr(config, "ingestion_seed_rows", 0)
+        if seed_n > 0:
+            seeded = 0
+            try:
+                for chunk in dataset.iter_batches():
+                    if seeded >= seed_n:
+                        break
+                    to_take = min(seed_n - seeded, len(chunk))
+                    seed_chunk = chunk.slice(0, to_take)
+                    await adapter.ingest_batch(seed_chunk, table_name)
+                    seeded += to_take
+                await adapter.flush()
+                logger.info("Streaming pre-seeded %d rows", seeded)
+            except Exception as exc:
+                logger.warning("Streaming pre-seed error: %s", exc)
 
         # Measurement: one full pass per measurement round
         measurement_timings: list[TimingResult] = []

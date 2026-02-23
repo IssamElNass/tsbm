@@ -146,10 +146,14 @@ def _column_definitions(schema: DatasetSchema, db: str) -> list[str]:
     defs = []
     for col in schema.columns:
         sql_type = get_db_type(col.arrow_type, col.role, db)
-        null_clause = "" if col.nullable else " NOT NULL"
-        # TimescaleDB requires the primary timestamp to be NOT NULL
-        if col.name == schema.timestamp_col and db == DB_TIMESCALEDB:
-            null_clause = " NOT NULL"
+        # QuestDB CREATE TABLE does not support NOT NULL constraints
+        if db == DB_QUESTDB:
+            null_clause = ""
+        else:
+            null_clause = "" if col.nullable else " NOT NULL"
+            # TimescaleDB requires the primary timestamp to be NOT NULL
+            if col.name == schema.timestamp_col and db == DB_TIMESCALEDB:
+                null_clause = " NOT NULL"
         defs.append(f"    {_quote(col.name, db)} {sql_type}{null_clause}")
     return defs
 

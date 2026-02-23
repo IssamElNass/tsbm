@@ -49,7 +49,15 @@ def cmd_run(
     ] = None,
     benchmark: Annotated[
         str,
-        typer.Option("--benchmark", "-b", help="Workload name (ingestion, time_range, aggregation, last_point, high_cardinality, downsampling, mixed, ingestion_out_of_order)."),
+        typer.Option(
+            "--benchmark", "-b",
+            help=(
+                "Workload to run, or 'all' to run every workload sequentially. "
+                "Available: ingestion, ingestion_out_of_order, time_range, aggregation, "
+                "last_point, high_cardinality, downsampling, mixed, "
+                "materialized_view, late_arrival, all."
+            ),
+        ),
     ] = "ingestion",
     config: Annotated[
         Optional[Path],

@@ -73,6 +73,10 @@ class WorkloadConfig(BaseModel):
     mv_granularity: str = "1 hour"          # time bucket granularity for MV benchmarks
     late_arrival_rounds: int = 10           # iterations for LateArrivalBenchmark
     late_arrival_batch_size: int = 100      # rows per late-arrival insertion
+    # Rows to pre-load into the table after warmup but before measurement rounds.
+    # 0 = disabled (default).  Only effective when reset_between_rounds = false;
+    # if reset_between_rounds = true the seed is wiped at the start of each round.
+    ingestion_seed_rows: int = 0
 
 
 # ---------------------------------------------------------------------------

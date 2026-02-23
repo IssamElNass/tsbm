@@ -1,3 +1,27 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# tsbm — benchmark configuration
+#
+# Quick-start dataset generation:
+#
+#   Small  (~100 K rows, quick smoke-test):
+#     tsbm generate --devices 100 --readings 1000 \
+#                   --output datasets/small_iot.parquet
+#
+#   Medium (~11 M rows, realistic IoT fleet):
+#     tsbm generate --devices 5000 --readings 2200 \
+#                   --output datasets/11m.parquet
+#
+#   Large  (~100 M rows, stress / capacity test):
+#     tsbm generate --devices 10000 --readings 10000 \
+#                   --output datasets/100m.parquet
+#
+# Then run all benchmarks in one command:
+#   tsbm run --benchmark all --dataset datasets/11m.parquet
+#   tsbm run --benchmark all --dataset datasets/100m.parquet
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Databases ─────────────────────────────────────────────────────────────────
+
 [databases.questdb]
 enabled   = true
 host      = "localhost"
@@ -13,31 +37,106 @@ pg_port   = 5432
 [databases.timescaledb]
 enabled   = true
 host      = "localhost"
-pg_port   = 5433          # host-mapped port (Docker maps 5433→5432 to avoid CrateDB conflict)
+pg_port   = 5433       # host-mapped port — Docker maps 5433 → 5432 inside the container
 user      = "postgres"
 password  = "postgres"
 dbname    = "tsbm"
 
+# ── Workload ──────────────────────────────────────────────────────────────────
+
 [workload]
-dataset              = "datasets/small_iot.csv"
-batch_sizes          = [1000, 5000, 10000, 50000]
-workers              = [1, 4, 8, 16]
-warmup_iterations    = 5
-measurement_rounds   = 30
-time_windows         = ["1min", "1h", "1day", "1week"]
-prng_seed            = 42
+
+# Dataset file used by all benchmarks unless overridden with --dataset.
+# Swap in a pre-generated Parquet file for large-scale runs (see header above).
+dataset = "datasets/small_iot.csv"
+
+# ── Ingestion batch sweep ──────────────────────────────────────────────────────
+# Each value is tested independently during the ingestion benchmarks.
+# Larger batches amortise per-call overhead; very small batches stress
+# the commit/WAL path.  Batch sizes larger than the dataset are capped
+# to the dataset size automatically.
+#
+# Tuning guide:
+#   ~100 K rows   →  [1_000, 10_000, 50_000, 100_000]
+#   ~11 M rows    →  [10_000, 100_000, 500_000, 1_000_000]
+#   ~100 M rows   →  [50_000, 500_000, 2_000_000, 10_000_000]
+batch_sizes = [10_000, 100_000, 500_000, 1_000_000]
+
+# Number of concurrent writer tasks per batch.
+workers = [1, 4, 8, 16]
+
+# Warmup iterations executed (and discarded) before measurement begins.
+# Warms caches, JIT, and connection pools.
+# Reduce to 2–3 for very large datasets to save time.
+warmup_iterations = 3
+
+# Measurement rounds per (batch_size × workers) combination.
+# Every round re-inserts one full batch, so total rows = batch_size × rounds.
+# Reduce for 100 M-row datasets (5 rounds is sufficient for stable statistics).
+measurement_rounds = 10
+
+# Time windows used by the query benchmarks (time_range, downsampling).
+time_windows = ["1min", "1h", "1day", "1week"]
+
+# Seed for reproducible random time-window generation.
+prng_seed = 42
+
+# Duration of the mixed (concurrent read + write) benchmark.
 mixed_duration_seconds = 60
+
+# Whether to truncate the table between every measurement round.
+# false = rows accumulate (tests write-under-load);
+# true  = isolated fresh-table measurement (more reproducible, slower overall).
 reset_between_rounds = false
-streaming_threshold_rows = 500000
-chunk_size               = 100000
-mv_granularity           = "1 hour"
-late_arrival_rounds      = 10
-late_arrival_batch_size  = 100
+
+# ── Streaming ─────────────────────────────────────────────────────────────────
+# Datasets larger than this row count are read from disk in chunks instead of
+# being loaded fully into RAM.
+#
+# Rule of thumb: set to ~10 % of the expected row count, minimum 500 K.
+#   11 M dataset  → 1_000_000
+#   100 M dataset → 5_000_000  (or lower if RAM is tight)
+streaming_threshold_rows = 1_000_000
+
+# Rows per streaming chunk.  Larger values = fewer I/O round-trips but higher
+# peak RAM.  500 K–2 M is a good range for machines with 16 GB+ RAM.
+chunk_size = 500_000
+
+# ── Materialized views ────────────────────────────────────────────────────────
+
+# Time granularity for materialized view / continuous aggregate creation.
+mv_granularity = "1 hour"
+
+# Rounds of late-arriving data ingestion (late_arrival benchmark).
+late_arrival_rounds = 10
+
+# Rows per late-arrival batch — should be small relative to the main dataset
+# but large enough to trigger a real MV refresh.
+late_arrival_batch_size = 10_000
+
+# ── Ingestion pre-seed (optional) ─────────────────────────────────────────────
+# When > 0, this many rows are inserted after the warmup phase and before the
+# first measurement round, so writes happen into an already-populated table.
+# This simulates real-world production writes where historical data, indexes,
+# and WAL segments are already present.
+#
+# Tuning guide:
+#   0               → clean-table baseline (default)
+#   ~10 % of dataset → mild pre-warm; indexes and partitions are established
+#   ~50 % of dataset → half-full table; tests compaction and index growth costs
+#
+# Note: has no effect when reset_between_rounds = true, because the table is
+# dropped at the start of each measurement round, wiping the seed rows.
+ingestion_seed_rows = 0
+
+# ── Results storage ───────────────────────────────────────────────────────────
 
 [results]
 sqlite_path = "results/runs.db"
 parquet_dir = "results/parquet"
 
+# ── Resource monitor ──────────────────────────────────────────────────────────
+
 [monitor]
 enabled     = true
-interval_ms = 500
+interval_ms = 500   # CPU / RSS sampling interval in milliseconds
