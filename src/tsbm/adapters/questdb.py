@@ -119,7 +119,7 @@ class QuestDBAdapter:
     async def drop_table(self, table_name: str) -> None:
         try:
             await self._pg_conn.execute(  # type: ignore[union-attr]
-                f"DROP TABLE IF EXISTS {table_name}"
+                f'DROP TABLE IF EXISTS "{table_name}"'
             )
         except Exception as exc:
             logger.warning("QuestDB drop_table %s: %s", table_name, exc)
@@ -206,7 +206,7 @@ class QuestDBAdapter:
 
     async def get_row_count(self, table_name: str) -> int:
         row = await self._pg_conn.fetchrow(  # type: ignore[union-attr]
-            f"SELECT count() FROM {table_name}"
+            f'SELECT count() FROM "{table_name}"'
         )
         return int(row[0]) if row else 0
 

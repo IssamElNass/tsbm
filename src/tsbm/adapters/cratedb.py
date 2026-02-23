@@ -110,7 +110,7 @@ class CrateDBAdapter:
     async def drop_table(self, table_name: str) -> None:
         try:
             await self._pg_conn.execute(  # type: ignore[union-attr]
-                f"DROP TABLE IF EXISTS {table_name}"
+                f'DROP TABLE IF EXISTS "{table_name}"'
             )
         except Exception as exc:
             logger.warning("CrateDB drop_table %s: %s", table_name, exc)
@@ -156,7 +156,7 @@ class CrateDBAdapter:
             f"${i + 1}::{cratedb_array_type(c)}" for i, c in enumerate(cols)
         )
         sql = (
-            f"INSERT INTO {table_name} ({col_names}) "
+            f'INSERT INTO "{table_name}" ({col_names}) '
             f"SELECT * FROM UNNEST({unnest_parts})"
         )
 
@@ -179,7 +179,7 @@ class CrateDBAdapter:
         if self._current_table and self._pg_conn is not None:
             try:
                 await self._pg_conn.execute(
-                    f"REFRESH TABLE {self._current_table}"
+                    f'REFRESH TABLE "{self._current_table}"'
                 )
             except Exception as exc:
                 logger.warning("CrateDB REFRESH TABLE failed: %s", exc)
@@ -202,7 +202,7 @@ class CrateDBAdapter:
 
     async def get_row_count(self, table_name: str) -> int:
         row = await self._pg_conn.fetchrow(  # type: ignore[union-attr]
-            f"SELECT count(*) FROM {table_name}"
+            f'SELECT count(*) FROM "{table_name}"'
         )
         return int(row[0]) if row else 0
 

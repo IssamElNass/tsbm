@@ -116,7 +116,7 @@ class TimescaleDBAdapter:
     async def drop_table(self, table_name: str) -> None:
         try:
             await self._conn.execute(  # type: ignore[union-attr]
-                f"DROP TABLE IF EXISTS {table_name} CASCADE"
+                f'DROP TABLE IF EXISTS "{table_name}" CASCADE'
             )
         except Exception as exc:
             logger.warning("TimescaleDB drop_table %s: %s", table_name, exc)
@@ -197,7 +197,7 @@ class TimescaleDBAdapter:
 
     async def get_row_count(self, table_name: str) -> int:
         row = await self._conn.fetchrow(  # type: ignore[union-attr]
-            f"SELECT count(*) FROM {table_name}"
+            f'SELECT count(*) FROM "{table_name}"'
         )
         return int(row[0]) if row else 0
 

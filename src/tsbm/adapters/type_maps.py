@@ -157,16 +157,16 @@ def _column_definitions(schema: DatasetSchema, db: str) -> list[str]:
 def _questdb_ddl(table_name: str, col_defs: list[str], ts_col: str) -> str:
     cols = ",\n".join(col_defs)
     return (
-        f"CREATE TABLE IF NOT EXISTS {table_name} (\n"
+        f'CREATE TABLE IF NOT EXISTS "{table_name}" (\n'
         f"{cols}\n"
-        f") TIMESTAMP({ts_col}) PARTITION BY DAY;"
+        f') TIMESTAMP("{ts_col}") PARTITION BY DAY;'
     )
 
 
 def _cratedb_ddl(table_name: str, col_defs: list[str]) -> str:
     cols = ",\n".join(col_defs)
     return (
-        f"CREATE TABLE IF NOT EXISTS {table_name} (\n"
+        f'CREATE TABLE IF NOT EXISTS "{table_name}" (\n'
         f"{cols}\n"
         f");"
     )
@@ -175,7 +175,7 @@ def _cratedb_ddl(table_name: str, col_defs: list[str]) -> str:
 def _timescaledb_ddl(table_name: str, col_defs: list[str]) -> str:
     cols = ",\n".join(col_defs)
     return (
-        f"CREATE TABLE IF NOT EXISTS {table_name} (\n"
+        f'CREATE TABLE IF NOT EXISTS "{table_name}" (\n'
         f"{cols}\n"
         f");"
     )
