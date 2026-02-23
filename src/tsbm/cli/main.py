@@ -26,6 +26,7 @@ from typing_extensions import Annotated
 from tsbm.cli.run import async_run, async_generate, async_load
 from tsbm.cli.compare import async_compare
 from tsbm.cli.dashboard import launch_dashboard
+from tsbm.cli.report import async_report
 
 app = typer.Typer(
     name="tsbm",
@@ -179,6 +180,52 @@ def cmd_compare(
         fmt=format,
         output=output,
         config_path=config,
+    ))
+
+
+# ---------------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------------
+
+
+@app.command("report")
+def cmd_report(
+    run_ids: Annotated[
+        Optional[List[str]],
+        typer.Argument(help="Run IDs to include. Omit to auto-discover latest completed runs."),
+    ] = None,
+    benchmark: Annotated[
+        Optional[str],
+        typer.Option("--benchmark", "-b", help="Limit report to a specific benchmark."),
+    ] = None,
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Output Markdown file path."),
+    ] = Path("results/report.md"),
+    config: Annotated[
+        Optional[Path],
+        typer.Option("--config", "-c", help="Path to benchmark.toml."),
+    ] = None,
+    latest: Annotated[
+        bool,
+        typer.Option(
+            "--latest/--no-latest",
+            help="Auto-select most recent completed run per (benchmark, database). Default: on.",
+        ),
+    ] = True,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Enable debug logging."),
+    ] = False,
+) -> None:
+    """Generate a comprehensive Markdown report of benchmark results with SQL queries."""
+    _setup_logging(verbose)
+    asyncio.run(async_report(
+        run_ids=list(run_ids) if run_ids else None,
+        benchmark_filter=benchmark,
+        output=output,
+        config_path=config,
+        latest=latest,
     ))
 
 

@@ -53,6 +53,7 @@ from tsbm.datasets.loader import (
 from tsbm.environment.capture import capture_environment, enrich_db_versions
 from tsbm.exceptions import ConfigError
 from tsbm.metrics.monitor import ResourceMonitor
+from tsbm.results.export import BENCHMARK_DESCRIPTIONS
 from tsbm.results.models import RunConfig
 from tsbm.results.storage import ResultStorage
 
@@ -64,48 +65,8 @@ console = Console()
 # Benchmark metadata
 # ---------------------------------------------------------------------------
 
-_BENCHMARK_DESCRIPTIONS: dict[str, str] = {
-    "ingestion": (
-        "Measures raw write throughput at varying batch sizes and worker counts. "
-        "Higher Rows/sec = better write performance. Critical for high-velocity IoT ingestion."
-    ),
-    "ingestion_out_of_order": (
-        "Same as ingestion but timestamps are shuffled before insert. "
-        "Reveals overhead for out-of-order writes and whether the database reorders efficiently."
-    ),
-    "time_range": (
-        "Scans a random time window using a WHERE clause. "
-        "Lower p99 latency = more predictable response times for dashboards and alerting."
-    ),
-    "aggregation": (
-        "GROUP BY time-bucket aggregations (avg/min/max per hour). "
-        "The most common time-series pattern — lower p99 indicates efficient aggregate pushdown."
-    ),
-    "last_point": (
-        "Fetches the most recent value per device/tag. "
-        "Tests LATEST BY / DISTINCT ON optimisation — critical for IoT status dashboards."
-    ),
-    "high_cardinality": (
-        "GROUP BY on a tag column with 10,000+ unique values. "
-        "Exposes cardinality bottlenecks that severely degrade performance in many systems."
-    ),
-    "downsampling": (
-        "Multi-resolution aggregation across 1-min, 1-hour, and 1-day windows. "
-        "Simulates reducing raw samples for long-term storage and trend analysis."
-    ),
-    "mixed": (
-        "Concurrent read and write workload running simultaneously. "
-        "Reflects real production load — high latency or low throughput here signals contention."
-    ),
-    "materialized_view": (
-        "Compares raw aggregation speed versus a pre-computed materialized view / continuous aggregate. "
-        "A large speedup ratio shows effective MV support; a small gain means overhead dominates."
-    ),
-    "late_arrival": (
-        "Measures cost of inserting out-of-order data when materialized views are active. "
-        "Low recompute overhead = efficient incremental MV refresh."
-    ),
-}
+# Benchmark descriptions are defined in results/export.py and re-exported here
+_BENCHMARK_DESCRIPTIONS = BENCHMARK_DESCRIPTIONS
 
 # Benchmarks where higher Rows/sec is the primary success metric
 _THROUGHPUT_BENCHMARKS: frozenset[str] = frozenset({
@@ -302,12 +263,14 @@ async def _run_adapters_for_workload(
             task_desc = f"[cyan]{adapter.name}[/cyan]"
             db_task: TaskID = progress.add_task(task_desc, total=None)
 
+            snapshot = dict(env)
+            snapshot["dataset_schema"] = dataset.schema.to_dict()
             run = RunConfig(
                 benchmark_name=workload_name,
                 database_name=adapter.name,
                 dataset_name=dataset.schema.name,
                 config_hash=config_hash,
-                config_snapshot=env,
+                config_snapshot=snapshot,
             )
             all_run_ids.append(run.run_id)
             storage.save_run(run)

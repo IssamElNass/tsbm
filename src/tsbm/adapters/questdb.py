@@ -32,6 +32,7 @@ import asyncpg
 import pandas as pd
 import pyarrow as pa
 
+from tsbm.adapters.base import RETRYABLE_CONNECTION_EXCEPTIONS
 from tsbm.adapters.type_maps import (
     DB_QUESTDB,
     arrow_table_to_ddl,
@@ -204,13 +205,27 @@ class QuestDBAdapter:
         sql: str,
         params: tuple = (),
     ) -> tuple[list[dict], TimingResult]:
-        await self._ensure_connected()
-        try:
-            with timed_operation() as result:
-                rows = await self._pg_conn.fetch(sql, *params)  # type: ignore[union-attr]
-            return [dict(r) for r in rows], result
-        except Exception as exc:
-            raise QueryError(f"QuestDB query failed: {exc}\nSQL: {sql}") from exc
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            if attempt > 0:
+                await asyncio.sleep(0.5 * attempt)
+                self._pg_conn = None  # force full reconnect
+            await self._ensure_connected()
+            try:
+                with timed_operation() as result:
+                    rows = await self._pg_conn.fetch(sql, *params)  # type: ignore[union-attr]
+                return [dict(r) for r in rows], result
+            except RETRYABLE_CONNECTION_EXCEPTIONS as exc:
+                last_exc = exc
+                logger.warning(
+                    "QuestDB: connection error on attempt %d/3: %s", attempt + 1, exc
+                )
+                continue
+            except Exception as exc:
+                raise QueryError(f"QuestDB query failed: {exc}\nSQL: {sql}") from exc
+        raise QueryError(
+            f"QuestDB query failed after 3 attempts: {last_exc}\nSQL: {sql}"
+        ) from last_exc
 
     async def get_row_count(self, table_name: str) -> int:
         row = await self._pg_conn.fetchrow(  # type: ignore[union-attr]

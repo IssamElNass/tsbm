@@ -200,3 +200,19 @@ class MVCapableAdapter(Protocol):
         Used by benchmarks to detect QuestDB no-ops (always False for QuestDB).
         """
         ...
+
+
+# ---------------------------------------------------------------------------
+# Retry helpers
+# ---------------------------------------------------------------------------
+
+import asyncpg.exceptions as _apg_exc  # noqa: E402
+
+RETRYABLE_CONNECTION_EXCEPTIONS: tuple[type[Exception], ...] = (
+    _apg_exc.ConnectionDoesNotExistError,
+    _apg_exc.ConnectionFailureError,
+    _apg_exc.InterfaceError,        # "connection is closed" local errors
+    _apg_exc.InternalClientError,
+    _apg_exc.CannotConnectNowError,
+    _apg_exc.TooManyConnectionsError,
+)
