@@ -159,7 +159,7 @@ def _questdb_ddl(table_name: str, col_defs: list[str], ts_col: str) -> str:
     return (
         f'CREATE TABLE IF NOT EXISTS "{table_name}" (\n'
         f"{cols}\n"
-        f') TIMESTAMP("{ts_col}") PARTITION BY DAY;'
+        f") TIMESTAMP({ts_col}) PARTITION BY DAY;"
     )
 
 

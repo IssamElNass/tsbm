@@ -243,12 +243,12 @@ class TimeRangeBenchmark(_QueryBenchmarkBase):
                 s = start.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 e = end.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 sql = (
-                    f"SELECT * FROM {tbl} "
-                    f"WHERE {ts} >= '{s}' AND {ts} < '{e}'"
+                    f'SELECT * FROM "{tbl}" '
+                    f'WHERE "{ts}" >= \'{s}\' AND "{ts}" < \'{e}\''
                 )
                 queries.append((sql, ()))
             else:
-                sql = f"SELECT * FROM {tbl} WHERE {ts} >= $1 AND {ts} < $2"
+                sql = f'SELECT * FROM "{tbl}" WHERE "{ts}" >= $1 AND "{ts}" < $2'
                 queries.append((sql, (start, end)))
         return queries
 
@@ -260,8 +260,8 @@ class TimeRangeBenchmark(_QueryBenchmarkBase):
         tbl = schema.name
         ts = schema.timestamp_col
         if adapter_name == _DB_QUESTDB:
-            return [(self.name, f"SELECT * FROM {tbl} WHERE {ts} >= '<start>' AND {ts} < '<end>'")]
-        return [(self.name, f"SELECT * FROM {tbl} WHERE {ts} >= $1 AND {ts} < $2")]
+            return [(self.name, f'SELECT * FROM "{tbl}" WHERE "{ts}" >= \'<start>\' AND "{ts}" < \'<end>\'')]
+        return [(self.name, f'SELECT * FROM "{tbl}" WHERE "{ts}" >= $1 AND "{ts}" < $2')]
 
 
 # ---------------------------------------------------------------------------
@@ -292,27 +292,27 @@ class AggregationBenchmark(_QueryBenchmarkBase):
                 s = start.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 e = end.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 sql = (
-                    f"SELECT {ts}, avg({metric}), min({metric}), max({metric}) "
-                    f"FROM {tbl} "
-                    f"WHERE {ts} >= '{s}' AND {ts} < '{e}' "
+                    f'SELECT "{ts}", avg("{metric}"), min("{metric}"), max("{metric}") '
+                    f'FROM "{tbl}" '
+                    f'WHERE "{ts}" >= \'{s}\' AND "{ts}" < \'{e}\' '
                     f"SAMPLE BY 1h"
                 )
                 queries.append((sql, ()))
             elif adapter_name == _DB_CRATEDB:
                 sql = (
-                    f"SELECT DATE_BIN('1 hour', {ts}, TIMESTAMP '1970-01-01') AS bucket, "
-                    f"avg({metric}), min({metric}), max({metric}) "
-                    f"FROM {tbl} "
-                    f"WHERE {ts} >= $1 AND {ts} < $2 "
+                    f"SELECT DATE_BIN('1 hour', \"{ts}\", TIMESTAMP '1970-01-01') AS bucket, "
+                    f'avg("{metric}"), min("{metric}"), max("{metric}") '
+                    f'FROM "{tbl}" '
+                    f'WHERE "{ts}" >= $1 AND "{ts}" < $2 '
                     f"GROUP BY bucket ORDER BY bucket"
                 )
                 queries.append((sql, (start, end)))
             else:  # timescaledb
                 sql = (
-                    f"SELECT time_bucket('1 hour', {ts}) AS bucket, "
-                    f"avg({metric}), min({metric}), max({metric}) "
-                    f"FROM {tbl} "
-                    f"WHERE {ts} >= $1 AND {ts} < $2 "
+                    f"SELECT time_bucket('1 hour', \"{ts}\") AS bucket, "
+                    f'avg("{metric}"), min("{metric}"), max("{metric}") '
+                    f'FROM "{tbl}" '
+                    f'WHERE "{ts}" >= $1 AND "{ts}" < $2 '
                     f"GROUP BY bucket ORDER BY bucket"
                 )
                 queries.append((sql, (start, end)))
@@ -328,17 +328,17 @@ class AggregationBenchmark(_QueryBenchmarkBase):
         metric = schema.metric_cols[0] if schema.metric_cols else "value"
         if adapter_name == _DB_QUESTDB:
             return [(self.name,
-                f"SELECT {ts}, avg({metric}), min({metric}), max({metric}) "
-                f"FROM {tbl} WHERE {ts} >= '<start>' AND {ts} < '<end>' SAMPLE BY 1h")]
+                f'SELECT "{ts}", avg("{metric}"), min("{metric}"), max("{metric}") '
+                f'FROM "{tbl}" WHERE "{ts}" >= \'<start>\' AND "{ts}" < \'<end>\' SAMPLE BY 1h')]
         if adapter_name == _DB_CRATEDB:
             return [(self.name,
-                f"SELECT DATE_BIN('1 hour', {ts}, TIMESTAMP '1970-01-01') AS bucket, "
-                f"avg({metric}), min({metric}), max({metric}) FROM {tbl} "
-                f"WHERE {ts} >= $1 AND {ts} < $2 GROUP BY bucket ORDER BY bucket")]
+                f"SELECT DATE_BIN('1 hour', \"{ts}\", TIMESTAMP '1970-01-01') AS bucket, "
+                f'avg("{metric}"), min("{metric}"), max("{metric}") FROM "{tbl}" '
+                f'WHERE "{ts}" >= $1 AND "{ts}" < $2 GROUP BY bucket ORDER BY bucket')]
         return [(self.name,
-            f"SELECT time_bucket('1 hour', {ts}) AS bucket, "
-            f"avg({metric}), min({metric}), max({metric}) FROM {tbl} "
-            f"WHERE {ts} >= $1 AND {ts} < $2 GROUP BY bucket ORDER BY bucket")]
+            f"SELECT time_bucket('1 hour', \"{ts}\") AS bucket, "
+            f'avg("{metric}"), min("{metric}"), max("{metric}") FROM "{tbl}" '
+            f'WHERE "{ts}" >= $1 AND "{ts}" < $2 GROUP BY bucket ORDER BY bucket')]
 
 
 # ---------------------------------------------------------------------------
@@ -368,23 +368,23 @@ class LastPointBenchmark(_QueryBenchmarkBase):
         for _ in windows:
             if adapter_name == _DB_QUESTDB:
                 sql = (
-                    f"SELECT {tag}, {metric}, {ts} "
-                    f"FROM {tbl} "
-                    f"LATEST ON {ts} PARTITION BY {tag}"
+                    f'SELECT "{tag}", "{metric}", "{ts}" '
+                    f'FROM "{tbl}" '
+                    f'LATEST ON "{ts}" PARTITION BY "{tag}"'
                 )
                 queries.append((sql, ()))
             elif adapter_name == _DB_CRATEDB:
                 sql = (
-                    f"SELECT DISTINCT ON ({tag}) {tag}, {metric}, {ts} "
-                    f"FROM {tbl} "
-                    f"ORDER BY {tag}, {ts} DESC"
+                    f'SELECT DISTINCT ON ("{tag}") "{tag}", "{metric}", "{ts}" '
+                    f'FROM "{tbl}" '
+                    f'ORDER BY "{tag}", "{ts}" DESC'
                 )
                 queries.append((sql, ()))
             else:  # timescaledb
                 sql = (
-                    f"SELECT DISTINCT ON ({tag}) {tag}, {metric}, {ts} "
-                    f"FROM {tbl} "
-                    f"ORDER BY {tag}, {ts} DESC"
+                    f'SELECT DISTINCT ON ("{tag}") "{tag}", "{metric}", "{ts}" '
+                    f'FROM "{tbl}" '
+                    f'ORDER BY "{tag}", "{ts}" DESC'
                 )
                 queries.append((sql, ()))
         return queries
@@ -400,10 +400,10 @@ class LastPointBenchmark(_QueryBenchmarkBase):
         metric = schema.metric_cols[0] if schema.metric_cols else "value"
         if adapter_name == _DB_QUESTDB:
             return [(self.name,
-                f"SELECT {tag}, {metric}, {ts} FROM {tbl} LATEST ON {ts} PARTITION BY {tag}")]
+                f'SELECT "{tag}", "{metric}", "{ts}" FROM "{tbl}" LATEST ON "{ts}" PARTITION BY "{tag}"')]
         return [(self.name,
-            f"SELECT DISTINCT ON ({tag}) {tag}, {metric}, {ts} FROM {tbl} "
-            f"ORDER BY {tag}, {ts} DESC")]
+            f'SELECT DISTINCT ON ("{tag}") "{tag}", "{metric}", "{ts}" FROM "{tbl}" '
+            f'ORDER BY "{tag}", "{ts}" DESC')]
 
 
 # ---------------------------------------------------------------------------
@@ -439,18 +439,18 @@ class HighCardinalityBenchmark(_QueryBenchmarkBase):
                 s = start.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 e = end.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 sql = (
-                    f"SELECT {tag}, count(), avg({metric}) "
-                    f"FROM {tbl} "
-                    f"WHERE {ts} >= '{s}' AND {ts} < '{e}' "
-                    f"ORDER BY {tag}"
+                    f'SELECT "{tag}", count(), avg("{metric}") '
+                    f'FROM "{tbl}" '
+                    f'WHERE "{ts}" >= \'{s}\' AND "{ts}" < \'{e}\' '
+                    f'ORDER BY "{tag}"'
                 )
                 queries.append((sql, ()))
             else:
                 sql = (
-                    f"SELECT {tag}, COUNT(*) as cnt, avg({metric}) "
-                    f"FROM {tbl} "
-                    f"WHERE {ts} >= $1 AND {ts} < $2 "
-                    f"GROUP BY {tag} ORDER BY {tag}"
+                    f'SELECT "{tag}", COUNT(*) as cnt, avg("{metric}") '
+                    f'FROM "{tbl}" '
+                    f'WHERE "{ts}" >= $1 AND "{ts}" < $2 '
+                    f'GROUP BY "{tag}" ORDER BY "{tag}"'
                 )
                 queries.append((sql, (start, end)))
         return queries
@@ -466,11 +466,11 @@ class HighCardinalityBenchmark(_QueryBenchmarkBase):
         metric = schema.metric_cols[0] if schema.metric_cols else "value"
         if adapter_name == _DB_QUESTDB:
             return [(self.name,
-                f"SELECT {tag}, count(), avg({metric}) FROM {tbl} "
-                f"WHERE {ts} >= '<start>' AND {ts} < '<end>' ORDER BY {tag}")]
+                f'SELECT "{tag}", count(), avg("{metric}") FROM "{tbl}" '
+                f'WHERE "{ts}" >= \'<start>\' AND "{ts}" < \'<end>\' ORDER BY "{tag}"')]
         return [(self.name,
-            f"SELECT {tag}, COUNT(*) as cnt, avg({metric}) FROM {tbl} "
-            f"WHERE {ts} >= $1 AND {ts} < $2 GROUP BY {tag} ORDER BY {tag}")]
+            f'SELECT "{tag}", COUNT(*) as cnt, avg("{metric}") FROM "{tbl}" '
+            f'WHERE "{ts}" >= $1 AND "{ts}" < $2 GROUP BY "{tag}" ORDER BY "{tag}"')]
 
 
 # ---------------------------------------------------------------------------
@@ -511,29 +511,29 @@ class DownsamplingBenchmark(_QueryBenchmarkBase):
                 s = start.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 e = end.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 sql = (
-                    f"SELECT {ts}, avg({metric}), min({metric}), max({metric}) "
-                    f"FROM {tbl} "
-                    f"WHERE {ts} >= '{s}' AND {ts} < '{e}' "
+                    f'SELECT "{ts}", avg("{metric}"), min("{metric}"), max("{metric}") '
+                    f'FROM "{tbl}" '
+                    f'WHERE "{ts}" >= \'{s}\' AND "{ts}" < \'{e}\' '
                     f"SAMPLE BY {gran}"
                 )
                 queries.append((sql, ()))
             elif adapter_name == _DB_CRATEDB:
                 gran = self._GRANULARITIES_DATE_BIN[i % len(self._GRANULARITIES_DATE_BIN)]
                 sql = (
-                    f"SELECT DATE_BIN('{gran}', {ts}, TIMESTAMP '1970-01-01') AS bucket, "
-                    f"avg({metric}), min({metric}), max({metric}) "
-                    f"FROM {tbl} "
-                    f"WHERE {ts} >= $1 AND {ts} < $2 "
+                    f"SELECT DATE_BIN('{gran}', \"{ts}\", TIMESTAMP '1970-01-01') AS bucket, "
+                    f'avg("{metric}"), min("{metric}"), max("{metric}") '
+                    f'FROM "{tbl}" '
+                    f'WHERE "{ts}" >= $1 AND "{ts}" < $2 '
                     f"GROUP BY bucket ORDER BY bucket"
                 )
                 queries.append((sql, (start, end)))
             else:  # timescaledb
                 gran = self._GRANULARITIES_TIME_BUCKET[i % len(self._GRANULARITIES_TIME_BUCKET)]
                 sql = (
-                    f"SELECT time_bucket('{gran}', {ts}) AS bucket, "
-                    f"avg({metric}), min({metric}), max({metric}) "
-                    f"FROM {tbl} "
-                    f"WHERE {ts} >= $1 AND {ts} < $2 "
+                    f"SELECT time_bucket('{gran}', \"{ts}\") AS bucket, "
+                    f'avg("{metric}"), min("{metric}"), max("{metric}") '
+                    f'FROM "{tbl}" '
+                    f'WHERE "{ts}" >= $1 AND "{ts}" < $2 '
                     f"GROUP BY bucket ORDER BY bucket"
                 )
                 queries.append((sql, (start, end)))
@@ -555,16 +555,16 @@ class DownsamplingBenchmark(_QueryBenchmarkBase):
         ):
             if adapter_name == _DB_QUESTDB:
                 result.append((f"{self.name}_{gran_q}",
-                    f"SELECT {ts}, avg({metric}), min({metric}), max({metric}) "
-                    f"FROM {tbl} WHERE {ts} >= '<start>' AND {ts} < '<end>' SAMPLE BY {gran_q}"))
+                    f'SELECT "{ts}", avg("{metric}"), min("{metric}"), max("{metric}") '
+                    f'FROM "{tbl}" WHERE "{ts}" >= \'<start>\' AND "{ts}" < \'<end>\' SAMPLE BY {gran_q}'))
             elif adapter_name == _DB_CRATEDB:
                 result.append((f"{self.name}_{gran_db}",
-                    f"SELECT DATE_BIN('{gran_db}', {ts}, TIMESTAMP '1970-01-01') AS bucket, "
-                    f"avg({metric}), min({metric}), max({metric}) FROM {tbl} "
-                    f"WHERE {ts} >= $1 AND {ts} < $2 GROUP BY bucket ORDER BY bucket"))
+                    f"SELECT DATE_BIN('{gran_db}', \"{ts}\", TIMESTAMP '1970-01-01') AS bucket, "
+                    f'avg("{metric}"), min("{metric}"), max("{metric}") FROM "{tbl}" '
+                    f'WHERE "{ts}" >= $1 AND "{ts}" < $2 GROUP BY bucket ORDER BY bucket'))
             else:
                 result.append((f"{self.name}_{gran_ts}",
-                    f"SELECT time_bucket('{gran_ts}', {ts}) AS bucket, "
-                    f"avg({metric}), min({metric}), max({metric}) FROM {tbl} "
-                    f"WHERE {ts} >= $1 AND {ts} < $2 GROUP BY bucket ORDER BY bucket"))
+                    f"SELECT time_bucket('{gran_ts}', \"{ts}\") AS bucket, "
+                    f'avg("{metric}"), min("{metric}"), max("{metric}") FROM "{tbl}" '
+                    f'WHERE "{ts}" >= $1 AND "{ts}" < $2 GROUP BY bucket ORDER BY bucket'))
         return result
