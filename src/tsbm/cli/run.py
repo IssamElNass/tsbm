@@ -75,7 +75,33 @@ _THROUGHPUT_BENCHMARKS: frozenset[str] = frozenset({
     "mixed",
 })
 
-# Benchmarks that query existing data and do not populate the table themselves
+# Benchmarks that need the full dataset pre-loaded into the database before running.
+# Pure query benchmarks share the seeded table (inherit seed across consecutive runs).
+# mixed, materialized_view, and late_arrival also benefit from pre-existing data:
+#   * mixed — readers are only meaningful when rows already exist
+#   * materialized_view / late_arrival — create views over a populated table
+_NEEDS_SEED_BENCHMARKS: frozenset[str] = frozenset({
+    "time_range",
+    "aggregation",
+    "last_point",
+    "high_cardinality",
+    "downsampling",
+    "mixed",
+    "materialized_view",
+    "late_arrival",
+})
+
+# Benchmarks that must drop + recreate the table on every run even if already seeded.
+# Ingestion manages its own warmup/measurement data; MV benchmarks need a fresh
+# table so that stale views from a previous run don't interfere.
+_ALWAYS_RESET_BENCHMARKS: frozenset[str] = frozenset({
+    "ingestion",
+    "ingestion_out_of_order",
+    "materialized_view",
+    "late_arrival",
+})
+
+# Keep the old name as an alias so the summary table renderer can still use it.
 _QUERY_ONLY_BENCHMARKS: frozenset[str] = frozenset({
     "time_range",
     "aggregation",
@@ -204,6 +230,13 @@ async def async_run(
     # ----------------------------------------------------------------
     all_run_ids: list[str] = []
 
+    # Track which adapter names already have the full dataset seeded so that
+    # consecutive query-only benchmarks (time_range → aggregation → last_point …)
+    # can reuse the table instead of dropping + re-seeding it every time.
+    # Non-query benchmarks (ingestion, mixed, …) manage their own data and will
+    # clear the set for any adapter they run against.
+    seeded_adapters: set[str] = set()
+
     for bench_idx, wl_name in enumerate(workload_names, 1):
         if len(workload_names) > 1:
             console.print(
@@ -220,6 +253,7 @@ async def async_run(
             storage=storage,
             env=env,
             config_hash=config_hash,
+            seeded_adapters=seeded_adapters,
         )
         all_run_ids.extend(run_ids)
 
@@ -243,8 +277,11 @@ async def _run_adapters_for_workload(
     storage: ResultStorage,
     env: dict[str, Any],
     config_hash: str,
+    seeded_adapters: set[str] | None = None,
 ) -> list[str]:
     """Run *workload* against every adapter; return the list of run_ids created."""
+    if seeded_adapters is None:
+        seeded_adapters = set()
     all_run_ids: list[str] = []
 
     with Progress(
@@ -283,23 +320,43 @@ async def _run_adapters_for_workload(
                 enrich_db_versions(env, adapter.name, version)
                 storage.save_run(run)  # refresh with db version in snapshot
 
-                progress.update(db_task, description=f"{task_desc} [dim]creating table…[/dim]")
-                await adapter.drop_table(dataset.schema.name)
-                await adapter.create_table(dataset.schema)
+                needs_seed = workload_name in _NEEDS_SEED_BENCHMARKS
+                always_reset = workload_name in _ALWAYS_RESET_BENCHMARKS
+                already_seeded = adapter.name in seeded_adapters
 
-                # Query-only benchmarks need pre-existing data to produce
-                # meaningful results — ingest the full dataset before querying.
-                # In streaming mode, chunks are fed one at a time to avoid
-                # loading the whole dataset into RAM at once.
-                if workload_name in _QUERY_ONLY_BENCHMARKS:
-                    progress.update(db_task, description=f"{task_desc} [dim]loading data…[/dim]")
-                    if dataset.streaming:
-                        for _chunk in dataset.iter_batches():
-                            await adapter.ingest_batch(_chunk, dataset.schema.name)
-                    else:
-                        _tbl = dataset.load()
-                        await adapter.ingest_batch(_tbl, dataset.schema.name)
-                    await adapter.flush()
+                if needs_seed and already_seeded and not always_reset:
+                    # Reuse the data seeded by a previous benchmark — skip the
+                    # drop/create/ingest cycle to avoid redundant I/O.
+                    # Applies to consecutive query benchmarks and to mixed when
+                    # query benchmarks have already populated the table.
+                    progress.update(
+                        db_task,
+                        description=f"{task_desc} [dim]reusing seeded table…[/dim]",
+                    )
+                else:
+                    # Drop, recreate, and optionally seed the table.
+                    # Ingestion and OOO-ingestion do not pre-seed here — they
+                    # manage their own warmup/measurement data internally.
+                    # MV benchmarks always reset so stale views don't interfere.
+                    seeded_adapters.discard(adapter.name)
+
+                    progress.update(db_task, description=f"{task_desc} [dim]creating table…[/dim]")
+                    await adapter.drop_table(dataset.schema.name)
+                    await adapter.create_table(dataset.schema)
+
+                    if needs_seed:
+                        # Pre-load the full dataset before the benchmark runs.
+                        # In streaming mode, chunks are fed one at a time to
+                        # avoid loading the whole dataset into RAM at once.
+                        progress.update(db_task, description=f"{task_desc} [dim]loading data…[/dim]")
+                        if dataset.streaming:
+                            for _chunk in dataset.iter_batches():
+                                await adapter.ingest_batch(_chunk, dataset.schema.name)
+                        else:
+                            _tbl = dataset.load()
+                            await adapter.ingest_batch(_tbl, dataset.schema.name)
+                        await adapter.flush()
+                        seeded_adapters.add(adapter.name)
 
                 # Start resource monitor
                 monitor: ResourceMonitor | None = None
@@ -548,38 +605,82 @@ def _print_summary_table(summaries: list[dict[str, Any]], benchmark_name: str) -
 
     verdicts = _assign_verdicts(summaries, benchmark_name)
 
-    table = Table(
-        title=f"Results — [bold]{benchmark_name}[/bold]",
+    # --- Table 1: Speed ---
+    speed_table = Table(
+        title=f"Speed — [bold]{benchmark_name}[/bold]",
         show_header=True,
         header_style="bold magenta",
     )
-    table.add_column("Database",  style="cyan",    no_wrap=True)
-    table.add_column("Operation", style="white")
-    table.add_column("Batch",     justify="right")
-    table.add_column("Workers",   justify="right")
-    table.add_column("p50 ms",    justify="right", style="green")
-    table.add_column("p99 ms",    justify="right", style="yellow")
-    table.add_column("Rows/sec",  justify="right", style="bold white")
-    table.add_column("Samples",   justify="right", style="dim")
-    table.add_column("Verdict",   justify="center")
+    speed_table.add_column("Database",  style="cyan",    no_wrap=True)
+    speed_table.add_column("Operation", style="white")
+    speed_table.add_column("Batch",     justify="right")
+    speed_table.add_column("Workers",   justify="right")
+    speed_table.add_column("p50 ms",    justify="right", style="green")
+    speed_table.add_column("Mean ms",   justify="right", style="green")
+    speed_table.add_column("p95 ms",    justify="right", style="yellow")
+    speed_table.add_column("p99 ms",    justify="right", style="yellow")
+    speed_table.add_column("p99.9 ms",  justify="right", style="red")
+    speed_table.add_column("Rows/sec",  justify="right", style="bold white")
+    speed_table.add_column("MB/sec",    justify="right", style="bold white")
+    speed_table.add_column("Samples",   justify="right", style="dim")
+    speed_table.add_column("Verdict",   justify="center")
 
     for i, row in enumerate(summaries):
         if row.get("latency_p50_ms") is None:
             continue
         rps = row.get("rows_per_second_mean", 0)
-        table.add_row(
+        mbs = row.get("mb_per_second_mean", 0)
+        speed_table.add_row(
             str(row.get("database_name", "")),
             str(row.get("operation", "")),
             f"{row.get('batch_size', 0):,}",
             str(row.get("workers", 1)),
             f"{row.get('latency_p50_ms', 0):.2f}",
+            f"{row.get('latency_mean_ms', 0):.2f}",
+            f"{row.get('latency_p95_ms', 0):.2f}",
             f"{row.get('latency_p99_ms', 0):.2f}",
+            f"{row.get('latency_p999_ms', 0):.2f}",
             f"{rps:,.0f}" if rps else "—",
+            f"{mbs:.1f}" if mbs else "—",
             str(row.get("sample_count", 0)),
             verdicts.get(i, ""),
         )
 
-    console.print(table)
+    console.print(speed_table)
+
+    # --- Table 2: Consistency ---
+    consistency_table = Table(
+        title=f"Consistency — [bold]{benchmark_name}[/bold]",
+        show_header=True,
+        header_style="bold blue",
+    )
+    consistency_table.add_column("Database",   style="cyan",  no_wrap=True)
+    consistency_table.add_column("Operation",  style="white")
+    consistency_table.add_column("Stddev ms",  justify="right", style="yellow")
+    consistency_table.add_column("CV%",        justify="right", style="yellow")
+    consistency_table.add_column("IQR ms",     justify="right", style="white")
+    consistency_table.add_column("Min ms",     justify="right", style="green")
+    consistency_table.add_column("Max ms",     justify="right", style="red")
+    consistency_table.add_column("Outliers",   justify="right", style="dim")
+
+    for row in summaries:
+        if row.get("latency_p50_ms") is None:
+            continue
+        stddev = row.get("latency_stddev_ms", 0) or 0
+        mean = row.get("latency_mean_ms", 0) or 0
+        cv = f"{stddev / mean * 100:.1f}%" if mean > 0 else "—"
+        consistency_table.add_row(
+            str(row.get("database_name", "")),
+            str(row.get("operation", "")),
+            f"{stddev:.2f}",
+            cv,
+            f"{row.get('latency_iqr_ms', 0):.2f}",
+            f"{row.get('latency_min_ms', 0):.2f}",
+            f"{row.get('latency_max_ms', 0):.2f}",
+            str(row.get("latency_outlier_count", 0)),
+        )
+
+    console.print(consistency_table)
     _print_interpretation(summaries, benchmark_name)
 
 

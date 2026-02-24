@@ -275,10 +275,28 @@ _THROUGHPUT_BENCHMARKS: frozenset[str] = frozenset({
 })
 
 _ALL_METRICS: list[tuple[str, str]] = [
+    # Throughput
     ("rows_per_second_mean", "Rows/sec (mean)"),
-    ("latency_p50_ms", "Latency p50 (ms)"),
-    ("latency_p95_ms", "Latency p95 (ms)"),
-    ("latency_p99_ms", "Latency p99 (ms)"),
+    ("rows_per_second_p95",  "Rows/sec (p95)"),
+    ("rows_per_second_p99",  "Rows/sec (p99)"),
+    ("mb_per_second_mean",   "MB/sec (mean)"),
+    # Latency — central tendency
+    ("latency_mean_ms",      "Latency mean (ms)"),
+    ("latency_p50_ms",       "Latency p50 (ms)"),
+    ("latency_p95_ms",       "Latency p95 (ms)"),
+    ("latency_p99_ms",       "Latency p99 (ms)"),
+    ("latency_p999_ms",      "Latency p99.9 (ms)"),
+    # Latency — spread / consistency
+    ("latency_stddev_ms",    "Latency stddev (ms)"),
+    ("latency_iqr_ms",       "Latency IQR (ms)"),
+    ("latency_min_ms",       "Latency min (ms)"),
+    ("latency_max_ms",       "Latency max (ms)"),
+    ("latency_outlier_count", "Outlier count"),
+    # Resource usage (blank cells when monitor is disabled)
+    ("resource_cpu_percent_mean",    "CPU % (mean)"),
+    ("resource_cpu_percent_max",     "CPU % (max)"),
+    ("resource_rss_mb_mean",         "RSS MB (mean)"),
+    ("resource_disk_write_mb_total", "Disk write MB"),
 ]
 
 

@@ -117,15 +117,30 @@ tsbm run --benchmark all --dataset datasets/11m.parquet
 
 Each benchmark prints its own results table with a verdict column and an interpretation summary as it completes.
 
-### 4. Compare runs
+### 4. Generate a report
+
+Generate a single Markdown file with all results and the exact SQL queries run against each database. Useful for sharing or comparing against another database outside of tsbm:
+
+```bash
+tsbm report                            # auto-discovers latest runs, writes results/report.md
+tsbm report --output comparison.md     # custom output path
+tsbm report --benchmark aggregation    # single benchmark only
+tsbm report abc123 def456              # specific run IDs
+```
+
+The report contains:
+- Side-by-side database comparison tables for every metric (Rows/sec, p50/p95/p99 latency)
+- The exact SQL executed per benchmark per database (with actual column names)
+
+### 5. Compare specific runs
 
 ```bash
 # Run IDs are printed at the end of every tsbm run call
 tsbm compare <run_id_1> <run_id_2> --format table
-tsbm compare <run_id_1> <run_id_2> --format markdown --output report.md
+tsbm compare <run_id_1> <run_id_2> --format markdown --output diff.md
 ```
 
-### 5. (Optional) Dashboard
+### 6. (Optional) Dashboard
 
 ```bash
 tsbm dashboard   # opens http://localhost:8501
@@ -230,6 +245,12 @@ Identical to `ingestion` but each batch's timestamp column is randomly permuted 
 
 Generates `warmup_iterations + measurement_rounds` random non-overlapping time windows from the dataset's own timestamp range. Runs `SELECT … WHERE ts >= $1 AND ts < $2` for each window. The window duration is taken from `time_windows[0]`.
 
+> **Seed-once behaviour** — When running `--benchmark all`, the dataset is loaded into the database once, and reused by all benchmarks that need pre-existing data. The rules are:
+> - **Query benchmarks** (`aggregation`, `downsampling`, `high_cardinality`, `last_point`, `time_range`): seed once, reuse across all consecutive runs.
+> - **`mixed`**: inherits the seeded table if one already exists (readers see realistic data), or seeds on first run.
+> - **`materialized_view` / `late_arrival`**: always drop + recreate + reseed to avoid stale view state from a previous run.
+> - **`ingestion` / `ingestion_out_of_order`**: always start fresh — they manage their own warmup/measurement data internally. Use `ingestion_seed_rows` to pre-populate before measurement rounds.
+
 #### `aggregation`
 
 Same window generation strategy, but runs a time-bucket `GROUP BY` query computing `avg`, `min`, and `max` of all metric columns per bucket.
@@ -255,6 +276,8 @@ Runs aggregation queries at all window sizes in `time_windows` (e.g. 1 min, 1 h,
 #### `mixed`
 
 Spawns concurrent read and write tasks for `mixed_duration_seconds` seconds. The write side uses the first entry in `batch_sizes` and `workers`. The read side runs random `time_range` queries. Measures steady-state throughput and latency under mixed pressure.
+
+The table is pre-seeded with the full dataset before the benchmark starts, so read queries operate on realistic data volumes from the first second. When run as part of `--benchmark all`, the existing seeded table is reused if query benchmarks already ran.
 
 #### `materialized_view`
 
@@ -599,6 +622,52 @@ tsbm compare abc123 def456 --operation ingestion --format csv --output ingestion
 
 ---
 
+### `tsbm report`
+
+Generates a self-contained Markdown file with all benchmark results and the SQL queries that were executed — useful for sharing, archiving, or comparing against a database not covered by tsbm.
+
+```
+tsbm report [RUN_IDS...] [OPTIONS]
+
+Arguments:
+  run_ids   Zero or more run IDs to include. Omit to auto-discover the latest
+            completed run per (benchmark, database) pair.
+
+Options:
+  --benchmark / -b  TEXT  Limit the report to one benchmark.
+  --output / -o     PATH  Output Markdown file. Default: results/report.md.
+  --latest          bool  Auto-select latest runs (default: on). Use --no-latest
+                          to disable when supplying explicit run IDs.
+  --config / -c     PATH  benchmark.toml path.
+  --verbose / -v          Enable DEBUG-level logging.
+```
+
+**Report contents:**
+
+| Section | Description |
+|---|---|
+| Run Metadata | Table of included runs — benchmark name, database, dataset, timestamps, run ID |
+| Results | Per-benchmark comparison tables with databases as columns — Rows/sec, p50/p95/p99 latency |
+| SQL Queries | Exact SQL templates per benchmark × database with real column names from the dataset |
+
+**Examples:**
+
+```bash
+# Auto-discover latest runs, write to results/report.md
+tsbm report
+
+# Custom output path
+tsbm report --output reports/2026-02-24.md
+
+# Only the aggregation benchmark
+tsbm report --benchmark aggregation
+
+# Specific run IDs (e.g. to compare two different dataset sizes)
+tsbm report abc123 def456 ghi789
+```
+
+---
+
 ### `tsbm dashboard`
 
 ```
@@ -613,6 +682,21 @@ Options:
 ---
 
 ## Results & Comparison
+
+### Generating a report
+
+`tsbm report` produces a single Markdown file containing all results and SQL queries — the easiest way to compare databases or share results. It auto-discovers the most recently completed run per benchmark and database:
+
+```bash
+tsbm report                         # → results/report.md
+tsbm report --output quarterly.md   # custom path
+```
+
+For quick terminal comparisons between two specific runs, use `tsbm compare`:
+
+```bash
+tsbm compare <run_id_a> <run_id_b> --format table
+```
 
 ### Storage layout
 
@@ -683,7 +767,7 @@ src/tsbm/
 ├── results/
 │   ├── models.py           # RunConfig, OperationResult, BenchmarkSummary
 │   ├── storage.py          # SQLite + Parquet persistence
-│   └── export.py           # CSV / JSON / Markdown export
+│   └── export.py           # CSV / JSON / Markdown / full report export
 ├── environment/
 │   └── capture.py          # Python version, OS, CPU info snapshot
 ├── dashboard/
@@ -692,6 +776,7 @@ src/tsbm/
     ├── main.py             # Typer app + command definitions
     ├── run.py              # Benchmark orchestration (run, generate, load)
     ├── compare.py          # tsbm compare command
+    ├── report.py           # tsbm report command (Markdown report with SQL queries)
     └── dashboard.py        # Streamlit subprocess launcher
 ```
 
