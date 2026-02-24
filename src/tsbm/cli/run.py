@@ -115,54 +115,71 @@ _QUERY_ONLY_BENCHMARKS: frozenset[str] = frozenset({
 # ---------------------------------------------------------------------------
 # Thresholds are (excellent_ms, good_ms, acceptable_ms) for the p99 metric.
 #
-# They scale with query complexity because a 1-minute window over a properly
-# partitioned hypertable fetches a handful of chunks, while a 1-week window
-# may scan hundreds of partitions and return millions of rows.  A flat
-# threshold like "≤ 5 ms = Excellent" made sense for OLTP but is unrealistic
-# for time-series databases at IoT scale (millions → billions of rows).
+# The critical distinction is RESULT SET SIZE:
 #
-# Rule of thumb used here:
-#   narrow window  (1 min)  → targets are 10× tighter than wide windows
-#   wide window    (1 week) → targets are relaxed to reflect full-partition scans
-#   full-table ops (last_point, downsampling) → very relaxed (no time filter)
+#   Aggregation queries (SAMPLE BY / time_bucket / DATE_BIN / GROUP BY)
+#   ─────────────────────────────────────────────────────────────────────
+#   Return a SMALL, FIXED-SIZE result regardless of window width: e.g.
+#   24 rows for hourly buckets over a day, or 168 rows for hourly over a
+#   week.  The DB computes in C++ / SIMD and sends back kilobytes.
+#   → Tight thresholds: 10-100 ms even on billions of rows is realistic.
+#   → Exceeding "Good" here means the engine lacks vectorisation or the
+#     chunk/partition strategy is wrong.
 #
-# The "good" tier maps roughly to "fits on a real-time dashboard with < 1 s
-# perceived latency even at p99"; "acceptable" maps to "tolerable for batch
-# reports or exploratory analysis".
+#   Raw-scan queries (SELECT * — time_range benchmark)
+#   ─────────────────────────────────────────────────────────────────────
+#   Return EVERY RAW ROW in the window.  A 1-week slice of 40 M rows
+#   can be ~750 K rows.  Transferring and deserialising that over a socket
+#   into Python dicts takes hundreds of milliseconds by physics alone —
+#   independent of how fast the database engine is.
+#   → Relaxed thresholds: the bottleneck is wire + deserialization, not DB.
+#   → No real-time production IoT system should issue raw SELECT * over
+#     multi-day windows; use aggregation instead.
+#
+# The "Good" tier maps to "fits on a real-time dashboard at p99"; the
+# "Acceptable" tier maps to "tolerable for batch reports or ad-hoc queries".
 _LATENCY_THRESHOLDS: dict[str, tuple[float, float, float]] = {
-    # ── Narrow window (1 min) ──────────────────────────────────────────────
-    # Proper partitioning should hit only 1-2 chunks → fast even at billions.
-    "time_range_1min":        (  10,    100,   1_000),
-    "aggregation_1min":       (  20,    200,   2_000),
-    "high_cardinality_1min":  (  20,    200,   2_000),
+    # ── Aggregation (SAMPLE BY / time_bucket / DATE_BIN) ──────────────────
+    # Returns N fixed-size buckets — tiny result, DB does the heavy lifting.
+    # A vectorised TSDB engine should be in the 5-100 ms range here even at
+    # billions of rows, because chunk pruning eliminates irrelevant data.
+    "aggregation_1min":       (  5,   30,    300),   # ~1 bucket returned
+    "aggregation_1h":         ( 20,  100,  1_000),   # ~60 buckets
+    "aggregation_1day":       ( 50,  500,  5_000),   # ~1 440 buckets
+    "aggregation_1week":      (100, 1_000, 10_000),  # ~10 080 buckets
 
-    # ── Hour-wide window ───────────────────────────────────────────────────
-    # Scans a full day-partition or several hour-chunks.
-    "time_range_1h":          (  50,    500,   5_000),
-    "aggregation_1h":         ( 100,  1_000,  10_000),
-    "high_cardinality_1h":    ( 100,  1_000,  10_000),
+    # ── High-cardinality GROUP BY (COUNT + AVG per tag) ────────────────────
+    # Returns one row per unique device/tag — small result like aggregation,
+    # but needs a hash GROUP BY step on top of the time filter.
+    "high_cardinality_1min":  ( 10,   50,    500),
+    "high_cardinality_1h":    ( 50,  300,  3_000),
+    "high_cardinality_1day":  (200, 1_500, 15_000),
+    "high_cardinality_1week": (500, 5_000, 30_000),
 
-    # ── Day-wide window ────────────────────────────────────────────────────
-    # May scan an entire daily partition → hundreds of MB of data.
-    "time_range_1day":        ( 200,  2_000,  20_000),
-    "aggregation_1day":       ( 200,  2_000,  20_000),
-    "high_cardinality_1day":  ( 200,  2_000,  20_000),
+    # ── Time-range raw scan (SELECT * — result scales with window) ─────────
+    # The DB may be fast but the bottleneck is moving rows over the wire and
+    # deserialising them in Python.  Thresholds are deliberately looser.
+    "time_range_1min":        ( 10,   50,    500),   # few hundred rows
+    "time_range_1h":          ( 50,  300,  3_000),   # thousands of rows
+    "time_range_1day":        (200, 1_500, 15_000),  # tens of thousands
+    "time_range_1week":       (500, 5_000, 30_000),  # hundreds of thousands
 
-    # ── Week-wide window ───────────────────────────────────────────────────
-    # Full partition-group scans; aggregation engines help but data volume is large.
-    "time_range_1week":       ( 500,  5_000,  30_000),
-    "aggregation_1week":      ( 500,  5_000,  30_000),
-    "high_cardinality_1week": ( 500,  5_000,  30_000),
+    # ── Last-point (most recent value per device, full-table) ─────────────
+    # QuestDB LATEST ON uses a native reversed-partition index — often < 20 ms.
+    # TimescaleDB DISTINCT ON is O(n_chunks).  CrateDB ROW_NUMBER() is slower.
+    # Thresholds sit at the TimescaleDB/CrateDB level; QuestDB will typically
+    # land in Excellent.
+    "last_point":             (100,  1_000, 10_000),
 
-    # ── Full-table queries (no time filter) ───────────────────────────────
-    # last_point scans every partition to find the most recent row per device.
-    # downsampling re-aggregates the whole dataset across multiple resolutions.
-    "last_point":             ( 500,  5_000,  30_000),
-    "downsampling":           (1_000, 10_000,  60_000),
+    # ── Downsampling (full dataset, multi-resolution, no time filter) ──────
+    # Aggregates everything at 1-min / 1-hour / 1-day granularity — the
+    # heaviest query in the suite.  Even vectorised engines need seconds on
+    # 40 M+ rows without a pre-built continuous aggregate / MV.
+    "downsampling":           (500, 5_000, 30_000),
 
     # ── Mixed benchmark ───────────────────────────────────────────────────
-    "mixed_read":             ( 200,  2_000,  10_000),
-    "mixed_write":            (  10,    100,   1_000),
+    "mixed_read":             (100,  1_000,  5_000),
+    "mixed_write":            ( 10,    100,  1_000),
 }
 # Fallback for any operation name not in the table above.
 _DEFAULT_LATENCY_THRESHOLD: tuple[float, float, float] = (50, 500, 5_000)
@@ -832,28 +849,61 @@ def _print_metric_glossary() -> None:
         "",
         "[bold]Verdict — how the rating is assigned:[/bold]",
         "",
-        "  When benchmarking a [bold]single database[/bold], the Verdict is absolute and",
-        "  scales with the query type (narrow windows have tighter targets than full-table",
-        "  scans, because a properly indexed 1-minute window should always be fast):",
+        "  The key to understanding these results is knowing what the database is actually",
+        "  being asked to do. There are two fundamentally different query types here:",
         "",
-        "    [green]Excellent[/green]   The database exploits indexes / partitions / pre-aggregation optimally.",
-        "                Suitable for sub-second real-time IoT dashboards.",
-        "    [green]Good[/green]        Fast enough for production dashboards and live monitoring.",
-        "    [yellow]Acceptable[/yellow]  Usable for batch reports or exploratory analysis, but may feel",
-        "                sluggish for interactive use.",
-        "    [red]Poor[/red]        Investigate: wrong chunk/partition size, missing index, not enough",
-        "                RAM for caches, or the query itself returns too many rows.",
+        "  ┌─ [bold][green]Aggregation queries[/green][/bold] ─────────────────────────────────────────────────────┐",
+        "  │  Benchmarks: aggregation, high_cardinality, downsampling                      │",
+        "  │                                                                               │",
+        "  │  The database crunches millions of rows internally and sends back a           │",
+        "  │  tiny summary — for example, 24 hourly averages over a 1-day window,          │",
+        "  │  or one row per device for last_point. The answer is always small.            │",
+        "  │                                                                               │",
+        "  │  → A well-configured TSDB should answer in milliseconds even on billions      │",
+        "  │    of rows, because vectorised engines + chunk pruning do the heavy           │",
+        "  │    lifting without shipping raw data over the wire.                           │",
+        "  │                                                                               │",
+        "  │  → If aggregation is slow, the database is not using its engine properly:     │",
+        "  │    check chunk/partition size, continuous aggregates, or compression.         │",
+        "  └───────────────────────────────────────────────────────────────────────────────┘",
         "",
-        "  When benchmarking [bold]multiple databases[/bold] simultaneously, the Verdict is",
-        "  relative: [green]Best[/green] / [yellow]Mid[/yellow] / [red]Worst[/red] within that group (no absolute scale).",
+        "  ┌─ [bold][yellow]Raw-scan queries[/yellow][/bold] ──────────────────────────────────────────────────────┐",
+        "  │  Benchmark: time_range                                                        │",
+        "  │                                                                               │",
+        "  │  SELECT * ships every raw row in the time window back to the client.          │",
+        "  │  A 1-week window over a 40 M-row dataset can return ~750 000 rows.            │",
+        "  │  Moving and deserialising that much data takes time regardless of             │",
+        "  │  how fast the database engine is — the bottleneck is the wire and             │",
+        "  │  the Python client, not the DB.                                               │",
+        "  │                                                                               │",
+        "  │  → Wide-window time_range results will naturally be slower. This is           │",
+        "  │    expected, not a sign of a poorly configured database.                      │",
+        "  │                                                                               │",
+        "  │  → In a real IoT production system you would never run SELECT * over          │",
+        "  │    a week of data — you would aggregate first. time_range benchmarks          │",
+        "  │    stress the raw I/O path, which is a useful but different test.             │",
+        "  └───────────────────────────────────────────────────────────────────────────────┘",
         "",
-        "  [dim]Threshold guide (p99 in ms, per query type):[/dim]",
-        "  [dim]  1-min window   Excellent ≤ 10 ms  │ Good ≤ 100 ms  │ Acceptable ≤ 1 s[/dim]",
-        "  [dim]  1-hour window  Excellent ≤ 50 ms  │ Good ≤ 500 ms  │ Acceptable ≤ 5 s[/dim]",
-        "  [dim]  1-day window   Excellent ≤ 200 ms │ Good ≤ 2 s     │ Acceptable ≤ 20 s[/dim]",
-        "  [dim]  1-week window  Excellent ≤ 500 ms │ Good ≤ 5 s     │ Acceptable ≤ 30 s[/dim]",
-        "  [dim]  last_point     Excellent ≤ 500 ms │ Good ≤ 5 s     │ Acceptable ≤ 30 s[/dim]",
-        "  [dim]  downsampling   Excellent ≤ 1 s    │ Good ≤ 10 s    │ Acceptable ≤ 60 s[/dim]",
+        "  [green]Excellent[/green]   Optimal — DB uses vectorised engines, chunk pruning, or native indexes.",
+        "  [green]Good[/green]        Fast enough for real-time IoT dashboards and live monitoring.",
+        "  [yellow]Acceptable[/yellow]  Fine for batch reports or scheduled jobs; too slow for live queries.",
+        "  [red]Poor[/red]        Investigate: chunk/partition size, missing indexes, RAM, or query design.",
+        "",
+        "  When benchmarking [bold]multiple databases[/bold] simultaneously the Verdict is relative:",
+        "  [green]Best[/green] / [yellow]Mid[/yellow] / [red]Worst[/red] within that group — no absolute thresholds apply.",
+        "",
+        "  [dim]Threshold guide (based on p99 latency):[/dim]",
+        "  [dim]                      Excellent    Good       Acceptable[/dim]",
+        "  [dim]  aggregation_1min    ≤  5 ms      ≤  30 ms   ≤  300 ms[/dim]",
+        "  [dim]  aggregation_1h      ≤ 20 ms      ≤ 100 ms   ≤    1 s [/dim]",
+        "  [dim]  aggregation_1day    ≤ 50 ms      ≤ 500 ms   ≤    5 s [/dim]",
+        "  [dim]  aggregation_1week   ≤ 100 ms     ≤   1 s    ≤   10 s [/dim]",
+        "  [dim]  time_range_1min     ≤  10 ms     ≤  50 ms   ≤  500 ms[/dim]",
+        "  [dim]  time_range_1h       ≤  50 ms     ≤ 300 ms   ≤    3 s [/dim]",
+        "  [dim]  time_range_1day     ≤ 200 ms     ≤ 1.5 s    ≤   15 s [/dim]",
+        "  [dim]  time_range_1week    ≤ 500 ms     ≤   5 s    ≤   30 s [/dim]",
+        "  [dim]  last_point          ≤ 100 ms     ≤   1 s    ≤   10 s [/dim]",
+        "  [dim]  downsampling        ≤ 500 ms     ≤   5 s    ≤   30 s [/dim]",
     ]
 
     console.print(

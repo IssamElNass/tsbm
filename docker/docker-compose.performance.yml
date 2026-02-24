@@ -1,0 +1,315 @@
+###############################################################################
+# TSBench — Performance-Tuned Docker Compose
+#
+# Optimised for a DEDICATED benchmark machine with ≥ 16 cores and ≥ 64 GB RAM
+# where all CPU and RAM are available to the databases.
+# Do NOT use on a shared host — memory limits are intentionally absent.
+#
+# Default target: 16 cores / 64 GB RAM
+# Each setting has a comment showing what to change for a 32-core / 128 GB machine:
+#   "# → 32c/128GB"
+#
+# For smaller machines (8 cores / 32 GB) use docker-compose.yml and apply
+# these overrides manually — see the scaling table at the bottom of this file.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.performance.yml up -d
+#   docker compose -f docker/docker-compose.performance.yml down
+#   docker compose -f docker/docker-compose.performance.yml down -v   # wipe data
+#
+# Port mappings match docker-compose.yml so benchmark.toml needs no changes:
+#   QuestDB:     5001:9000  (ILP HTTP)
+#                8812:8812  (PGWire)
+#   CrateDB:     4200:4200  (HTTP / Admin UI)
+#                5432:5432  (PGWire)
+#   TimescaleDB: 5433:5432
+###############################################################################
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # QuestDB
+  #
+  # Key levers:
+  #   QDB_SHARED_WORKER_COUNT
+  #     Background I/O, WAL application, and compaction workers.
+  #     Set to physical core count — one worker per core saturates I/O without
+  #     context-switching overhead.
+  #
+  #   QDB_CAIRO_SQL_PARALLEL_FILTER_WORKER_COUNT
+  #     Worker threads used to evaluate WHERE filters in parallel across
+  #     partitions.  Set to core count so every concurrent query can use
+  #     the full machine when it runs alone.
+  #
+  #   QDB_CAIRO_SQL_PARALLEL_GROUPBY_ENABLED
+  #     Enables SIMD-vectorised parallel GROUP BY / SAMPLE BY aggregation.
+  #     This is the single biggest win for aggregation benchmarks — each
+  #     partition is aggregated on a separate thread and results merged.
+  #
+  #   QDB_CAIRO_MAX_UNCOMMITTED_ROWS
+  #     Rows buffered in the WAL commit queue before a forced flush.
+  #     Higher values batch more rows per commit, reducing write overhead
+  #     during bulk ingestion.  Uses RAM proportional to row size (~70 B/row).
+  #
+  #   QDB_LINE_HTTP_RECV_BUFFER_SIZE
+  #     Socket receive buffer for ILP over HTTP.  Must be large enough to
+  #     hold one full batch without fragmenting across multiple reads.
+  # ---------------------------------------------------------------------------
+  questdb:
+    image: questdb/questdb:latest
+    container_name: tsbench_perf_questdb
+    restart: unless-stopped
+    ports:
+      - "5001:9000"   # ILP HTTP
+      - "8812:8812"   # PGWire
+    environment:
+      QDB_HTTP_ENABLED: "true"
+
+      # Parallelism — match physical core count
+      QDB_SHARED_WORKER_COUNT: "16"                        # → 32c: 32
+      QDB_CAIRO_SQL_PARALLEL_FILTER_WORKER_COUNT: "16"     # → 32c: 32
+      QDB_CAIRO_SQL_PARALLEL_GROUPBY_ENABLED: "true"
+
+      # Write path — 4 M rows buffered before commit (~280 MB at 70 B/row)
+      QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "4000000"            # → 32c/128GB: 8000000
+
+      # Network — 32 MB receive buffer handles large ILP batches in one read
+      QDB_LINE_HTTP_RECV_BUFFER_SIZE: "33554432"           # 32 MB
+
+      # HTTP handler threads for Web Console and REST queries
+      QDB_HTTP_WORKER_COUNT: "8"                           # → 32c: 16
+    volumes:
+      - questdb_perf_data:/var/lib/questdb
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # CrateDB
+  #
+  # Key levers:
+  #   CRATE_HEAP_SIZE
+  #     JVM heap for CrateDB's Lucene index engine.  Rule: 50% of total RAM.
+  #     Too small → frequent GC pauses that inflate p99/p99.9 latency.
+  #     Too large → leaves no room for the OS page cache that CrateDB also
+  #     relies on for mmap segment reads, hurting repeated-query performance.
+  #
+  #   indices.memory.index_buffer_size
+  #     Write buffer for Lucene segment indexing.  Higher = faster ingestion
+  #     and fewer segment merges, at the cost of heap usage.
+  #     Keep below 25% of heap to avoid GC pressure.
+  #
+  #   index.number_of_shards
+  #     Default shard count for new tables (set at CREATE TABLE time, cannot
+  #     be changed later).  One shard per core is optimal for single-node
+  #     setups: each shard is a self-contained Lucene index processed on one
+  #     thread, so N shards saturate N cores in parallel for aggregations.
+  #
+  #   node.store.allow_mmap
+  #     Memory-mapped I/O for Lucene segment reads.  Allows the OS page cache
+  #     to serve hot data directly from RAM without copying to JVM heap.
+  #     Dramatically faster for repeated queries on warm data.
+  #
+  #   threadpool.search.size / threadpool.write.size
+  #     CrateDB thread-pool sizes for query execution and ingestion.
+  #     Set to core count to saturate parallel workloads.
+  # ---------------------------------------------------------------------------
+  cratedb:
+    image: crate:latest
+    container_name: tsbench_perf_cratedb
+    restart: unless-stopped
+    ports:
+      - "4200:4200"   # HTTP / Admin UI
+      - "5432:5432"   # PGWire
+    environment:
+      # Heap = 50% of RAM; leave the other 50% for OS page cache / mmap
+      CRATE_HEAP_SIZE: "32g"                               # → 32c/128GB: 64g
+    command: >
+      crate
+      -Cnetwork.host=0.0.0.0
+      -Cdiscovery.type=single-node
+
+      -Cnode.store.allow_mmap=true
+
+      -Cindex.number_of_replicas=0
+      -Cindex.number_of_shards=16                          # → 32c: 32
+
+      -Cindices.memory.index_buffer_size=8192mb            # → 32c/128GB: 16384mb
+
+      -Ccluster.routing.allocation.disk.threshold_enabled=false
+
+      -Cthreadpool.search.size=16                          # → 32c: 32
+      -Cthreadpool.write.size=16                           # → 32c: 32
+    volumes:
+      - cratedb_perf_data:/data
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # TimescaleDB (PostgreSQL)
+  #
+  # Key levers:
+  #   shared_buffers
+  #     PostgreSQL's hot-data cache in shared memory.  Rule: 25% of RAM.
+  #     Chunks accessed repeatedly are served from RAM instead of disk.
+  #     This is the single most impactful setting — raising it from the
+  #     default 128 MB to 25% of RAM typically halves query latency.
+  #
+  #   effective_cache_size
+  #     Planner hint: total RAM available for caching (shared_buffers +
+  #     OS page cache combined).  Rule: 75% of RAM.  Does NOT allocate
+  #     memory — it tells the planner to prefer index scans over seq scans.
+  #
+  #   work_mem
+  #     Memory per sort or hash-aggregate operation inside a single query.
+  #     Each parallel worker gets its own slice, so peak usage can reach:
+  #       connections × workers_per_query × work_mem
+  #     512 MB is safe at 64 GB with 8 parallel workers per query.
+  #
+  #   max_parallel_workers_per_gather
+  #     Parallel workers spawned per query.  Rule: core_count / 2 so two
+  #     concurrent queries can each use half the CPU without fighting.
+  #     At 16 cores → 8 workers/query; both cores fully used with 2 clients.
+  #
+  #   max_parallel_workers
+  #     Hard cap on total parallel workers across all queries.  Set to
+  #     core count so the machine is never over-subscribed.
+  #
+  #   enable_partitionwise_aggregate
+  #     CRITICAL for TimescaleDB.  Each hypertable chunk is aggregated
+  #     independently in a parallel worker, then results are merged.
+  #     Without this flag PostgreSQL aggregates all chunks on a single
+  #     thread after gathering raw rows — useless for time-series workloads.
+  #
+  #   jit
+  #     PostgreSQL JIT compilation.  Helps long-running analytical queries
+  #     but adds compilation overhead that hurts short TSDB queries running
+  #     under concurrent load.  Disable for benchmark workloads.
+  #
+  #   random_page_cost
+  #     Cost model for random disk reads.  Default is 4.0 (spinning disk).
+  #     Set to 1.1 when data fits in RAM or on NVMe — tells the planner to
+  #     prefer index scans and bitmap scans instead of sequential scans.
+  #
+  #   synchronous_commit
+  #     Waits for WAL flush on every COMMIT when on.  Turning off risks
+  #     losing ~200 ms of commits on a crash but is acceptable for
+  #     benchmarks and gives a large ingestion throughput improvement.
+  #
+  #   timescaledb.max_background_workers
+  #     TimescaleDB-specific workers for compression jobs, continuous
+  #     aggregate refresh, and chunk maintenance tasks.  Should be higher
+  #     than the default (8) on machines with many cores.
+  #
+  #   shm_size
+  #     Docker's default shared memory is 64 MB.  PostgreSQL maps
+  #     shared_buffers into /dev/shm — if shm_size < shared_buffers the
+  #     container crashes at startup with a "could not resize shared memory
+  #     segment" error.  Always set shm_size > shared_buffers.
+  # ---------------------------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: tsbench_perf_timescaledb
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: tsbm
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    command: >
+      postgres
+
+      -c shared_buffers=16GB
+      -c effective_cache_size=48GB
+      -c work_mem=512MB
+      -c maintenance_work_mem=4GB
+
+      -c max_parallel_workers_per_gather=8
+      -c max_parallel_workers=16
+      -c max_worker_processes=32
+
+      -c enable_partitionwise_aggregate=on
+      -c enable_partitionwise_join=on
+      -c jit=off
+      -c random_page_cost=1.1
+      -c seq_page_cost=1.0
+      -c default_statistics_target=500
+
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=64MB
+      -c max_wal_size=8GB
+      -c min_wal_size=2GB
+      -c synchronous_commit=off
+      -c bgwriter_lru_maxpages=200
+      -c bgwriter_delay=50ms
+
+      -c timescaledb.max_background_workers=32
+    # shm_size must exceed shared_buffers — Docker default of 64 MB will crash.
+    shm_size: '18gb'
+    volumes:
+      - timescaledb_perf_data:/var/lib/postgresql/data
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tsbm"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+volumes:
+  questdb_perf_data:
+    name: tsbench_perf_questdb_data
+  cratedb_perf_data:
+    name: tsbench_perf_cratedb_data
+  timescaledb_perf_data:
+    name: tsbench_perf_timescaledb_data
+
+###############################################################################
+# Scaling reference
+#
+#  Setting                              8c/32GB   16c/64GB   32c/128GB
+#  ─────────────────────────────────────────────────────────────────────
+#  QuestDB shared worker count              8         16          32
+#  QuestDB parallel filter workers          8         16          32
+#  QuestDB HTTP workers                     4          8          16
+#  QuestDB max uncommitted rows         2 000K     4 000K      8 000K
+#  QuestDB ILP recv buffer               16 MB      32 MB       64 MB
+#  ─────────────────────────────────────────────────────────────────────
+#  CrateDB heap                           16g        32g         64g
+#  CrateDB default shards                  8         16          32
+#  CrateDB index buffer                 4096mb    8192mb     16384mb
+#  CrateDB search/write threadpool          8         16          32
+#  ─────────────────────────────────────────────────────────────────────
+#  TimescaleDB shared_buffers             8GB       16GB         32GB
+#  TimescaleDB effective_cache_size      24GB       48GB         96GB
+#  TimescaleDB work_mem                 256MB      512MB          1GB
+#  TimescaleDB maintenance_work_mem       2GB        4GB          8GB
+#  TimescaleDB parallel workers/query      4          8           12
+#  TimescaleDB max_parallel_workers        8         16           32
+#  TimescaleDB max_worker_processes       16         32           64
+#  TimescaleDB max_background_workers     16         32           64
+#  TimescaleDB shm_size                  10gb       18gb         36gb
+###############################################################################
