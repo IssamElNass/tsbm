@@ -110,6 +110,78 @@ _QUERY_ONLY_BENCHMARKS: frozenset[str] = frozenset({
     "downsampling",
 })
 
+# ---------------------------------------------------------------------------
+# IoT-scale latency thresholds
+# ---------------------------------------------------------------------------
+# Thresholds are (excellent_ms, good_ms, acceptable_ms) for the p99 metric.
+#
+# They scale with query complexity because a 1-minute window over a properly
+# partitioned hypertable fetches a handful of chunks, while a 1-week window
+# may scan hundreds of partitions and return millions of rows.  A flat
+# threshold like "≤ 5 ms = Excellent" made sense for OLTP but is unrealistic
+# for time-series databases at IoT scale (millions → billions of rows).
+#
+# Rule of thumb used here:
+#   narrow window  (1 min)  → targets are 10× tighter than wide windows
+#   wide window    (1 week) → targets are relaxed to reflect full-partition scans
+#   full-table ops (last_point, downsampling) → very relaxed (no time filter)
+#
+# The "good" tier maps roughly to "fits on a real-time dashboard with < 1 s
+# perceived latency even at p99"; "acceptable" maps to "tolerable for batch
+# reports or exploratory analysis".
+_LATENCY_THRESHOLDS: dict[str, tuple[float, float, float]] = {
+    # ── Narrow window (1 min) ──────────────────────────────────────────────
+    # Proper partitioning should hit only 1-2 chunks → fast even at billions.
+    "time_range_1min":        (  10,    100,   1_000),
+    "aggregation_1min":       (  20,    200,   2_000),
+    "high_cardinality_1min":  (  20,    200,   2_000),
+
+    # ── Hour-wide window ───────────────────────────────────────────────────
+    # Scans a full day-partition or several hour-chunks.
+    "time_range_1h":          (  50,    500,   5_000),
+    "aggregation_1h":         ( 100,  1_000,  10_000),
+    "high_cardinality_1h":    ( 100,  1_000,  10_000),
+
+    # ── Day-wide window ────────────────────────────────────────────────────
+    # May scan an entire daily partition → hundreds of MB of data.
+    "time_range_1day":        ( 200,  2_000,  20_000),
+    "aggregation_1day":       ( 200,  2_000,  20_000),
+    "high_cardinality_1day":  ( 200,  2_000,  20_000),
+
+    # ── Week-wide window ───────────────────────────────────────────────────
+    # Full partition-group scans; aggregation engines help but data volume is large.
+    "time_range_1week":       ( 500,  5_000,  30_000),
+    "aggregation_1week":      ( 500,  5_000,  30_000),
+    "high_cardinality_1week": ( 500,  5_000,  30_000),
+
+    # ── Full-table queries (no time filter) ───────────────────────────────
+    # last_point scans every partition to find the most recent row per device.
+    # downsampling re-aggregates the whole dataset across multiple resolutions.
+    "last_point":             ( 500,  5_000,  30_000),
+    "downsampling":           (1_000, 10_000,  60_000),
+
+    # ── Mixed benchmark ───────────────────────────────────────────────────
+    "mixed_read":             ( 200,  2_000,  10_000),
+    "mixed_write":            (  10,    100,   1_000),
+}
+# Fallback for any operation name not in the table above.
+_DEFAULT_LATENCY_THRESHOLD: tuple[float, float, float] = (50, 500, 5_000)
+
+
+def _get_latency_thresholds(operation: str) -> tuple[float, float, float]:
+    """
+    Return ``(excellent_ms, good_ms, acceptable_ms)`` for *operation*.
+
+    Tries an exact match first, then a prefix match, then falls back to
+    ``_DEFAULT_LATENCY_THRESHOLD``.
+    """
+    if operation in _LATENCY_THRESHOLDS:
+        return _LATENCY_THRESHOLDS[operation]
+    for key, thresholds in _LATENCY_THRESHOLDS.items():
+        if operation.startswith(key):
+            return thresholds
+    return _DEFAULT_LATENCY_THRESHOLD
+
 
 # ---------------------------------------------------------------------------
 # run
@@ -275,6 +347,11 @@ async def async_run(
 
     if len(workload_names) > 1:
         console.print(f"\n[dim]All run IDs: {', '.join(all_run_ids)}[/dim]")
+
+    # Print the metric glossary once at the very end so the user has a
+    # reference for every column they just saw in the results tables.
+    console.print()
+    _print_metric_glossary()
 
 
 async def _run_adapters_for_workload(
@@ -568,11 +645,13 @@ def _assign_verdicts(summaries: list[dict[str, Any]], benchmark_name: str) -> di
                     verdicts[idx] = "[red]Poor[/red]"
             else:
                 p99 = row.get("latency_p99_ms", 0) or 0
-                if p99 <= 5:
+                op = row.get("operation", "")
+                excellent_ms, good_ms, acceptable_ms = _get_latency_thresholds(op)
+                if p99 <= excellent_ms:
                     verdicts[idx] = "[green]Excellent[/green]"
-                elif p99 <= 50:
+                elif p99 <= good_ms:
                     verdicts[idx] = "[green]Good[/green]"
-                elif p99 <= 500:
+                elif p99 <= acceptable_ms:
                     verdicts[idx] = "[yellow]Acceptable[/yellow]"
                 else:
                     verdicts[idx] = "[red]Poor[/red]"
@@ -693,6 +772,100 @@ def _print_summary_table(summaries: list[dict[str, Any]], benchmark_name: str) -
     _print_interpretation(summaries, benchmark_name)
 
 
+def _print_metric_glossary() -> None:
+    """
+    Print a plain-English panel explaining every column in the Speed and
+    Consistency tables, plus the Verdict thresholds.
+
+    Called once at the end of a benchmark run so the user can reference the
+    glossary after reading the results.
+    """
+    speed_lines = [
+        "[bold]Speed table — what each column means:[/bold]",
+        "",
+        "  [green]p50 ms[/green]"
+        "      Median latency. Half of all queries finished faster than this number.",
+        "              This is the most reliable indicator of 'typical' speed.",
+        "  [green]Mean ms[/green]"
+        "     Mathematical average. A few very slow queries can pull this above p50,",
+        "              so p50 is usually a better indicator of day-to-day performance.",
+        "  [yellow]p95 ms[/yellow]"
+        "      95th percentile. 95 out of every 100 queries finished faster than this.",
+        "              Use this to judge performance on a 'slow day'.",
+        "  [yellow]p99 ms[/yellow]"
+        "      99th percentile. Only 1 in 100 queries was slower. This is the industry",
+        "              standard for Service Level Agreements (SLAs) and dashboard targets.",
+        "              [bold]This value drives the Verdict.[/bold]",
+        "  [red]p99.9 ms[/red]"
+        "    Worst 1 in 1,000 queries (extreme tail). Always shown in red to flag it",
+        "              as an outlier metric — the red colour is cosmetic, not a verdict.",
+        "  Rows/sec    How many data rows the database processed per second. Higher is better.",
+        "              For ingestion this is write speed; for queries it is scan throughput.",
+        "  MB/sec      Same as Rows/sec but measured in megabytes of data.",
+        "  Samples     Number of individual query measurements taken. More samples =",
+        "              more reliable statistics (p99 with 5 samples is a rough estimate).",
+    ]
+
+    consistency_lines = [
+        "",
+        "[bold]Consistency table — how stable (predictable) the database is:[/bold]",
+        "",
+        "  Stddev ms   Standard deviation of latency. Low = responses arrive at a steady",
+        "              pace. High = unpredictable spikes (bad for real-time dashboards).",
+        "  CV%         Coefficient of Variation = Stddev ÷ Mean × 100.",
+        "              Under 20% → very consistent.  20–50% → moderate jitter.",
+        "              Over 50% → erratic; investigate GC pauses, compaction, or I/O.",
+        "  IQR ms      Interquartile range — the spread of the middle 50% of queries.",
+        "              Unlike Stddev, IQR ignores extreme outliers so it shows 'normal'",
+        "              variability without being distorted by one-off slow queries.",
+        "  [green]Min ms[/green]"
+        "      The single fastest query observed across all measurement rounds.",
+        "  [red]Max ms[/red]"
+        "      The single slowest query observed. Always red to highlight it as the",
+        "              worst case — not a verdict, just an eye-catcher for investigation.",
+        "  Outliers    Count of queries that were statistically much slower than the rest",
+        "              (outside 1.5 × IQR above Q3). High counts suggest background jobs,",
+        "              compaction, or garbage collection interfering with query latency.",
+    ]
+
+    verdict_lines = [
+        "",
+        "[bold]Verdict — how the rating is assigned:[/bold]",
+        "",
+        "  When benchmarking a [bold]single database[/bold], the Verdict is absolute and",
+        "  scales with the query type (narrow windows have tighter targets than full-table",
+        "  scans, because a properly indexed 1-minute window should always be fast):",
+        "",
+        "    [green]Excellent[/green]   The database exploits indexes / partitions / pre-aggregation optimally.",
+        "                Suitable for sub-second real-time IoT dashboards.",
+        "    [green]Good[/green]        Fast enough for production dashboards and live monitoring.",
+        "    [yellow]Acceptable[/yellow]  Usable for batch reports or exploratory analysis, but may feel",
+        "                sluggish for interactive use.",
+        "    [red]Poor[/red]        Investigate: wrong chunk/partition size, missing index, not enough",
+        "                RAM for caches, or the query itself returns too many rows.",
+        "",
+        "  When benchmarking [bold]multiple databases[/bold] simultaneously, the Verdict is",
+        "  relative: [green]Best[/green] / [yellow]Mid[/yellow] / [red]Worst[/red] within that group (no absolute scale).",
+        "",
+        "  [dim]Threshold guide (p99 in ms, per query type):[/dim]",
+        "  [dim]  1-min window   Excellent ≤ 10 ms  │ Good ≤ 100 ms  │ Acceptable ≤ 1 s[/dim]",
+        "  [dim]  1-hour window  Excellent ≤ 50 ms  │ Good ≤ 500 ms  │ Acceptable ≤ 5 s[/dim]",
+        "  [dim]  1-day window   Excellent ≤ 200 ms │ Good ≤ 2 s     │ Acceptable ≤ 20 s[/dim]",
+        "  [dim]  1-week window  Excellent ≤ 500 ms │ Good ≤ 5 s     │ Acceptable ≤ 30 s[/dim]",
+        "  [dim]  last_point     Excellent ≤ 500 ms │ Good ≤ 5 s     │ Acceptable ≤ 30 s[/dim]",
+        "  [dim]  downsampling   Excellent ≤ 1 s    │ Good ≤ 10 s    │ Acceptable ≤ 60 s[/dim]",
+    ]
+
+    console.print(
+        Panel(
+            "\n".join(speed_lines + consistency_lines + verdict_lines),
+            title="[bold dim]Metric Glossary — how to read these results[/bold dim]",
+            border_style="dim",
+            padding=(0, 1),
+        )
+    )
+
+
 def _print_interpretation(summaries: list[dict[str, Any]], benchmark_name: str) -> None:
     """Print a human-readable interpretation panel below the results table."""
     is_throughput = benchmark_name in _THROUGHPUT_BENCHMARKS
@@ -732,6 +905,8 @@ def _print_interpretation(summaries: list[dict[str, Any]], benchmark_name: str) 
             worst = max(valid, key=lambda r: r.get("latency_p99_ms", 0) or 0)
             best_p99 = best.get("latency_p99_ms", 0) or 0
             worst_p99 = worst.get("latency_p99_ms", 0) or 0
+            op = rows[0].get("operation", "")
+            excellent_ms, good_ms, acceptable_ms = _get_latency_thresholds(op)
 
             if len(valid) > 1:
                 ratio = f" ({worst_p99 / best_p99:.1f}× slower)" if best_p99 > 0 else ""
@@ -742,8 +917,17 @@ def _print_interpretation(summaries: list[dict[str, Any]], benchmark_name: str) 
                     f"[bold]{worst_p99:.1f} ms[/bold]{ratio}."
                 )
             else:
-                icon = "[green]↓[/green]" if best_p99 <= 50 else "[yellow]~[/yellow]" if best_p99 <= 500 else "[red]↑[/red]"
-                label = "Excellent" if best_p99 <= 5 else "Good" if best_p99 <= 50 else "Acceptable" if best_p99 <= 500 else "Poor"
+                icon = (
+                    "[green]↓[/green]" if best_p99 <= good_ms
+                    else "[yellow]~[/yellow]" if best_p99 <= acceptable_ms
+                    else "[red]↑[/red]"
+                )
+                label = (
+                    "Excellent" if best_p99 <= excellent_ms
+                    else "Good" if best_p99 <= good_ms
+                    else "Acceptable" if best_p99 <= acceptable_ms
+                    else "Poor"
+                )
                 lines.append(f"{icon} p99 latency: [bold]{best_p99:.1f} ms[/bold] — {label}.")
 
     if lines:
