@@ -59,7 +59,7 @@ class QuestDBAdapter:
 
     def __init__(self, config: QuestDBConfig) -> None:
         self._config = config
-        self._pg_conn: asyncpg.Connection | None = None
+        self._pool: asyncpg.Pool | None = None
         self._schema: DatasetSchema | None = None
         self._current_table: str | None = None
         self._mv_granularity: str = "1 hour"
@@ -70,9 +70,9 @@ class QuestDBAdapter:
     # ------------------------------------------------------------------
 
     async def connect(self) -> None:
-        """Open the asyncpg connection on the PGWire port."""
+        """Open a connection pool on the PGWire port."""
         try:
-            self._pg_conn = await asyncpg.connect(
+            self._pool = await asyncpg.create_pool(
                 host=self._config.host,
                 port=self._config.pg_port,
                 database="qdb",
@@ -80,26 +80,28 @@ class QuestDBAdapter:
                 password="quest",
                 statement_cache_size=0,  # QuestDB PGWire has partial PS support
                 command_timeout=60,
+                min_size=1,
+                max_size=32,
             )
             logger.debug("QuestDB: connected on port %d", self._config.pg_port)
         except Exception as exc:
             raise ConnectionError(f"QuestDB connection failed: {exc}") from exc
 
     async def disconnect(self) -> None:
-        if self._pg_conn is not None:
-            await self._pg_conn.close()
-            self._pg_conn = None
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
             logger.debug("QuestDB: disconnected")
 
     async def _ensure_connected(self) -> None:
-        """Reconnect the PGWire connection if the server closed it."""
-        if self._pg_conn is None or self._pg_conn.is_closed():
-            logger.warning("QuestDB: connection closed — reconnecting")
+        """Reconnect the pool if it was never created or was closed."""
+        if self._pool is None:
+            logger.warning("QuestDB: pool not initialised — reconnecting")
             await self.connect()
 
     async def health_check(self) -> bool:
         try:
-            await self._pg_conn.fetchval("SELECT 1")  # type: ignore[union-attr]
+            await self._pool.fetchval("SELECT 1")  # type: ignore[union-attr]
             return True
         except Exception:
             return False
@@ -119,13 +121,13 @@ class QuestDBAdapter:
         ddl = arrow_table_to_ddl(schema, DB_QUESTDB, schema.name, self._config.partition_by)
         logger.debug("QuestDB DDL:\n%s", ddl)
         try:
-            await self._pg_conn.execute(ddl)  # type: ignore[union-attr]
+            await self._pool.execute(ddl)  # type: ignore[union-attr]
         except Exception as exc:
             raise QueryError(f"QuestDB create_table failed: {exc}") from exc
 
     async def drop_table(self, table_name: str) -> None:
         try:
-            await self._pg_conn.execute(  # type: ignore[union-attr]
+            await self._pool.execute(  # type: ignore[union-attr]
                 f'DROP TABLE IF EXISTS "{table_name}"'
             )
         except Exception as exc:
@@ -133,7 +135,7 @@ class QuestDBAdapter:
 
     async def table_exists(self, table_name: str) -> bool:
         try:
-            row = await self._pg_conn.fetchrow(  # type: ignore[union-attr]
+            row = await self._pool.fetchrow(  # type: ignore[union-attr]
                 "SELECT table_name FROM tables() WHERE table_name = $1",
                 table_name,
             )
@@ -205,15 +207,14 @@ class QuestDBAdapter:
         sql: str,
         params: tuple = (),
     ) -> tuple[list[dict], TimingResult]:
+        await self._ensure_connected()
         last_exc: Exception | None = None
         for attempt in range(3):
             if attempt > 0:
                 await asyncio.sleep(0.5 * attempt)
-                self._pg_conn = None  # force full reconnect
-            await self._ensure_connected()
             try:
                 with timed_operation() as result:
-                    rows = await self._pg_conn.fetch(sql, *params)  # type: ignore[union-attr]
+                    rows = await self._pool.fetch(sql, *params)  # type: ignore[union-attr]
                 return [dict(r) for r in rows], result
             except RETRYABLE_CONNECTION_EXCEPTIONS as exc:
                 last_exc = exc
@@ -228,7 +229,7 @@ class QuestDBAdapter:
         ) from last_exc
 
     async def get_row_count(self, table_name: str) -> int:
-        row = await self._pg_conn.fetchrow(  # type: ignore[union-attr]
+        row = await self._pool.fetchrow(  # type: ignore[union-attr]
             f'SELECT count() FROM "{table_name}"'
         )
         return int(row[0]) if row else 0
@@ -239,13 +240,13 @@ class QuestDBAdapter:
 
     async def get_version(self) -> str:
         try:
-            row = await self._pg_conn.fetchrow(  # type: ignore[union-attr]
+            row = await self._pool.fetchrow(  # type: ignore[union-attr]
                 "SELECT build FROM build()"
             )
             return str(row[0]) if row else "unknown"
         except Exception:
             try:
-                row = await self._pg_conn.fetchrow("SELECT version()")  # type: ignore[union-attr]
+                row = await self._pool.fetchrow("SELECT version()")  # type: ignore[union-attr]
                 return str(row[0]) if row else "unknown"
             except Exception:
                 return "unknown"
@@ -303,9 +304,9 @@ class QuestDBAdapter:
         )
 
         try:
-            await self._pg_conn.execute(drop_sql)  # type: ignore[union-attr]
-            await self._pg_conn.execute(create_sql)  # type: ignore[union-attr]
-            await _wait_for_mv_refresh(self._pg_conn, view_name)  # type: ignore[union-attr]
+            await self._pool.execute(drop_sql)  # type: ignore[union-attr]
+            await self._pool.execute(create_sql)  # type: ignore[union-attr]
+            await _wait_for_mv_refresh(self._pool, view_name)  # type: ignore[union-attr]
             logger.debug("QuestDB: created materialized view %r", view_name)
         except Exception as exc:
             raise QueryError(
@@ -335,8 +336,8 @@ class QuestDBAdapter:
         )
         try:
             with timed_operation() as result:
-                await self._pg_conn.execute(refresh_sql)  # type: ignore[union-attr]
-                await _wait_for_mv_refresh(self._pg_conn, view_name)  # type: ignore[union-attr]
+                await self._pool.execute(refresh_sql)  # type: ignore[union-attr]
+                await _wait_for_mv_refresh(self._pool, view_name)  # type: ignore[union-attr]
             return result
         except Exception as exc:
             raise QueryError(
@@ -346,7 +347,7 @@ class QuestDBAdapter:
     async def drop_materialized_view(self, view_name: str) -> None:
         """Drop the QuestDB materialized view (idempotent)."""
         try:
-            await self._pg_conn.execute(  # type: ignore[union-attr]
+            await self._pool.execute(  # type: ignore[union-attr]
                 f'DROP MATERIALIZED VIEW IF EXISTS "{view_name}"'
             )
         except Exception as exc:
@@ -355,7 +356,7 @@ class QuestDBAdapter:
     async def view_exists(self, view_name: str) -> bool:
         """Return True if the QuestDB materialized view exists."""
         try:
-            rows = await self._pg_conn.fetch(  # type: ignore[union-attr]
+            rows = await self._pool.fetch(  # type: ignore[union-attr]
                 "SELECT view_name FROM materialized_views() WHERE view_name = $1",
                 view_name,
             )
@@ -390,7 +391,7 @@ def _granularity_to_questdb(granularity: str) -> str:
 
 
 async def _wait_for_mv_refresh(
-    conn: asyncpg.Connection,
+    conn: asyncpg.Pool,
     view_name: str,
     timeout_seconds: float = 120.0,
     poll_interval: float = 0.5,

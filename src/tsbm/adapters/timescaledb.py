@@ -49,7 +49,7 @@ class TimescaleDBAdapter:
 
     def __init__(self, config: TimescaleDBConfig) -> None:
         self._config = config
-        self._conn: asyncpg.Connection | None = None
+        self._pool: asyncpg.Pool | None = None
         self._schema: DatasetSchema | None = None
         self._current_table: str | None = None
 
@@ -59,13 +59,15 @@ class TimescaleDBAdapter:
 
     async def connect(self) -> None:
         try:
-            self._conn = await asyncpg.connect(
+            self._pool = await asyncpg.create_pool(
                 host=self._config.host,
                 port=self._config.pg_port,
                 database=self._config.dbname,
                 user=self._config.user,
                 password=self._config.password,
                 command_timeout=120,
+                min_size=1,
+                max_size=32,
             )
             logger.debug(
                 "TimescaleDB: connected on port %d db=%s",
@@ -76,20 +78,20 @@ class TimescaleDBAdapter:
             raise ConnectionError(f"TimescaleDB connection failed: {exc}") from exc
 
     async def disconnect(self) -> None:
-        if self._conn is not None:
-            await self._conn.close()
-            self._conn = None
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
             logger.debug("TimescaleDB: disconnected")
 
     async def _ensure_connected(self) -> None:
-        """Reconnect the asyncpg connection if the server closed it."""
-        if self._conn is None or self._conn.is_closed():
-            logger.warning("TimescaleDB: connection closed — reconnecting")
+        """Reconnect the pool if it was never created or was closed."""
+        if self._pool is None:
+            logger.warning("TimescaleDB: pool not initialised — reconnecting")
             await self.connect()
 
     async def health_check(self) -> bool:
         try:
-            await self._conn.fetchval("SELECT 1")  # type: ignore[union-attr]
+            await self._pool.fetchval("SELECT 1")  # type: ignore[union-attr]
             return True
         except Exception:
             return False
@@ -112,8 +114,8 @@ class TimescaleDBAdapter:
         ddl = arrow_table_to_ddl(schema, DB_TIMESCALEDB, schema.name)
         logger.debug("TimescaleDB DDL:\n%s", ddl)
         try:
-            await self._conn.execute(ddl)  # type: ignore[union-attr]
-            await self._conn.execute(  # type: ignore[union-attr]
+            await self._pool.execute(ddl)  # type: ignore[union-attr]
+            await self._pool.execute(  # type: ignore[union-attr]
                 "SELECT create_hypertable($1, $2, if_not_exists => TRUE, "
                 "chunk_time_interval => $3::INTERVAL)",
                 schema.name,
@@ -125,7 +127,7 @@ class TimescaleDBAdapter:
 
     async def drop_table(self, table_name: str) -> None:
         try:
-            await self._conn.execute(  # type: ignore[union-attr]
+            await self._pool.execute(  # type: ignore[union-attr]
                 f'DROP TABLE IF EXISTS "{table_name}" CASCADE'
             )
         except Exception as exc:
@@ -133,7 +135,7 @@ class TimescaleDBAdapter:
 
     async def table_exists(self, table_name: str) -> bool:
         try:
-            row = await self._conn.fetchrow(  # type: ignore[union-attr]
+            row = await self._pool.fetchrow(  # type: ignore[union-attr]
                 "SELECT tablename FROM pg_tables WHERE tablename = $1",
                 table_name,
             )
@@ -173,11 +175,12 @@ class TimescaleDBAdapter:
         await self._ensure_connected()
         try:
             with timed_operation(rows=n_rows, bytes_count=n_bytes) as result:
-                await self._conn.copy_records_to_table(  # type: ignore[union-attr]
-                    table_name,
-                    records=records,
-                    columns=columns,
-                )
+                async with self._pool.acquire() as conn:  # type: ignore[union-attr]
+                    await conn.copy_records_to_table(
+                        table_name,
+                        records=records,
+                        columns=columns,
+                    )
             return result
         except Exception as exc:
             raise IngestionError(
@@ -197,15 +200,14 @@ class TimescaleDBAdapter:
         sql: str,
         params: tuple = (),
     ) -> tuple[list[dict], TimingResult]:
+        await self._ensure_connected()
         last_exc: Exception | None = None
         for attempt in range(3):
             if attempt > 0:
                 await asyncio.sleep(0.5 * attempt)
-                self._conn = None  # force full reconnect
-            await self._ensure_connected()
             try:
                 with timed_operation() as result:
-                    rows = await self._conn.fetch(sql, *params)  # type: ignore[union-attr]
+                    rows = await self._pool.fetch(sql, *params)  # type: ignore[union-attr]
                 return [dict(r) for r in rows], result
             except RETRYABLE_CONNECTION_EXCEPTIONS as exc:
                 last_exc = exc
@@ -222,7 +224,7 @@ class TimescaleDBAdapter:
         ) from last_exc
 
     async def get_row_count(self, table_name: str) -> int:
-        row = await self._conn.fetchrow(  # type: ignore[union-attr]
+        row = await self._pool.fetchrow(  # type: ignore[union-attr]
             f'SELECT count(*) FROM "{table_name}"'
         )
         return int(row[0]) if row else 0
@@ -233,8 +235,8 @@ class TimescaleDBAdapter:
 
     async def get_version(self) -> str:
         try:
-            pg_ver = await self._conn.fetchval("SELECT version()")  # type: ignore[union-attr]
-            ts_ver = await self._conn.fetchval(  # type: ignore[union-attr]
+            pg_ver = await self._pool.fetchval("SELECT version()")  # type: ignore[union-attr]
+            ts_ver = await self._pool.fetchval(  # type: ignore[union-attr]
                 "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'"
             )
             ts_str = f" / TimescaleDB {ts_ver}" if ts_ver else ""
@@ -295,10 +297,10 @@ class TimescaleDBAdapter:
         )
 
         try:
-            await self._conn.execute(drop_sql)  # type: ignore[union-attr]
-            await self._conn.execute(create_sql)  # type: ignore[union-attr]
+            await self._pool.execute(drop_sql)  # type: ignore[union-attr]
+            await self._pool.execute(create_sql)  # type: ignore[union-attr]
             # Full historical refresh — may be slow for large tables
-            await self._conn.execute(refresh_sql)  # type: ignore[union-attr]
+            await self._pool.execute(refresh_sql)  # type: ignore[union-attr]
             logger.debug("TimescaleDB: created continuous aggregate %r", view_name)
         except Exception as exc:
             raise QueryError(
@@ -319,7 +321,7 @@ class TimescaleDBAdapter:
         """
         try:
             with timed_operation() as result:
-                await self._conn.execute(  # type: ignore[union-attr]
+                await self._pool.execute(  # type: ignore[union-attr]
                     f"CALL refresh_continuous_aggregate($1, $2::timestamptz, $3::timestamptz)",
                     view_name,
                     start,
@@ -333,7 +335,7 @@ class TimescaleDBAdapter:
 
     async def drop_materialized_view(self, view_name: str) -> None:
         try:
-            await self._conn.execute(  # type: ignore[union-attr]
+            await self._pool.execute(  # type: ignore[union-attr]
                 f'DROP MATERIALIZED VIEW IF EXISTS "{view_name}" CASCADE'
             )
         except Exception as exc:
@@ -341,7 +343,7 @@ class TimescaleDBAdapter:
 
     async def view_exists(self, view_name: str) -> bool:
         try:
-            row = await self._conn.fetchrow(  # type: ignore[union-attr]
+            row = await self._pool.fetchrow(  # type: ignore[union-attr]
                 "SELECT view_name FROM timescaledb_information.continuous_aggregates "
                 "WHERE view_name = $1",
                 view_name,
