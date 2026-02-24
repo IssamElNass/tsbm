@@ -20,11 +20,13 @@ each run is deterministic and reproducible.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.compute as pc
 
 from tsbm.benchmarks.base import BenchmarkResult
@@ -73,6 +75,46 @@ def _pick_tag(schema: "DatasetSchema", config: Any) -> str:
 _DB_QUESTDB = "questdb"
 _DB_CRATEDB = "cratedb"
 _DB_TIMESCALEDB = "timescaledb"
+
+
+# ---------------------------------------------------------------------------
+# Timestamp column loading helpers
+# ---------------------------------------------------------------------------
+
+
+def _read_ts_column_as_table(source_path: Any, ts_col: str) -> pa.Table:
+    """
+    Read **only** the timestamp column from *source_path* as a minimal
+    single-column Arrow table.
+
+    For Parquet files this is very efficient — PyArrow only reads the pages
+    belonging to the requested column (column-projection pushdown), so reading
+    one column from a 40 M-row file costs ~320 MB instead of ~2.8 GB.
+
+    Used by query benchmarks on streaming / large datasets where we need the
+    dataset's time range to generate random windows, but the full table is
+    already pre-seeded in the database and does not need to live in Python
+    memory.
+    """
+    from pathlib import Path
+    import pyarrow.parquet as pq
+    import pyarrow.csv as pa_csv
+
+    path = Path(source_path)
+    suffix = path.suffix.lower()
+
+    if suffix in {".parquet", ".parq"}:
+        return pq.read_table(path, columns=[ts_col])
+
+    if suffix == ".csv":
+        # ConvertOptions.include_columns instructs PyArrow to skip all other columns
+        convert_opts = pa_csv.ConvertOptions(include_columns=[ts_col])
+        return pa_csv.read_csv(path, convert_options=convert_opts)
+
+    # JSON / JSONL: no column-projection pushdown; load fully and slice
+    import pyarrow.json as pa_json
+    full = pa_json.read_json(path)
+    return pa.table({ts_col: full.column(ts_col)})
 
 
 # ---------------------------------------------------------------------------
@@ -145,12 +187,23 @@ class _QueryBenchmarkBase:
     """
     Shared run() logic for all query benchmarks.
 
-    Subclasses override ``_build_sql()`` to return the database-specific SQL
-    and optionally ``_params()`` to return asyncpg parameter tuples.
+    Subclasses override ``_make_queries()`` to return database-specific SQL.
+
+    Class attribute ``_iterate_time_windows``:
+      * ``True``  (default) — run the full warmup+measurement cycle once per
+        entry in ``config.time_windows``, producing one summary per window size
+        (e.g. ``time_range_1min``, ``time_range_1h``).  This exercises the
+        database across short and long windows and avoids the benchmark
+        finishing in under 5 seconds on a fast machine.
+      * ``False`` — run only a single cycle using ``time_windows[0]`` and keep
+        the operation name as ``self.name``.  Used by benchmarks that do not
+        filter on a time range (``LastPointBenchmark``) or that manage their
+        own granularity cycling (``DownsamplingBenchmark``).
     """
 
     name: str = "query"
     description: str = "Generic query benchmark"
+    _iterate_time_windows: bool = True
 
     async def run(
         self,
@@ -165,74 +218,121 @@ class _QueryBenchmarkBase:
             benchmark_name=self.name,
         )
 
-        table = dataset.load()
         schema = dataset.schema
-        windows = _random_windows(
-            n=config.measurement_rounds + config.warmup_iterations,
-            table=table,
-            ts_col=schema.timestamp_col,
-            window_duration=_window_from_config(
-                config.time_windows[0] if config.time_windows else "1h"
-            ),
-            seed=config.prng_seed,
+
+        # For window-range computation we only need the timestamp column min/max.
+        # Avoid loading the full table for streaming (large) datasets — the data
+        # is already pre-seeded in the database and we only need the time bounds.
+        if dataset.table is not None:
+            _ts_table = dataset.table
+        else:
+            _ts_table = _read_ts_column_as_table(dataset.source_path, schema.timestamp_col)
+
+        # Determine which window sizes to iterate over.
+        windows_to_run: list[str] = (
+            list(config.time_windows) if (self._iterate_time_windows and config.time_windows)
+            else ([config.time_windows[0]] if config.time_windows else ["1h"])
         )
-        if not windows:
-            result.errors.append("No valid time windows; dataset may be empty.")
-            return result
 
-        queries = self._make_queries(schema, adapter.name, windows, config)
+        workers_list: list[int] = config.workers if config.workers else [1]
 
-        # ---- Warmup ----
-        warmup_q = queries[: config.warmup_iterations]
-        for i, (sql, params) in enumerate(warmup_q):
-            try:
-                _, timing = await adapter.execute_query(sql, params)
-                result.operation_results.append(
-                    OperationResult.from_timing(
-                        run_id=run_id,
-                        database_name=adapter.name,
-                        operation=self.name,
-                        phase="warmup",
-                        iteration=i,
-                        timing=timing,
+        for workers in workers_list:
+            for window_cfg_str in windows_to_run:
+                # Operation name includes the window size when iterating multiple windows
+                # so results are stored and reported separately (e.g. time_range_1min).
+                operation = (
+                    f"{self.name}_{window_cfg_str}"
+                    if self._iterate_time_windows and len(windows_to_run) > 1
+                    else self.name
+                )
+
+                # Generate enough windows for warmup (sequential) + measurement
+                # rounds × workers (each concurrent slot gets its own distinct window).
+                windows = _random_windows(
+                    n=config.warmup_iterations + config.measurement_rounds * workers,
+                    table=_ts_table,
+                    ts_col=schema.timestamp_col,
+                    window_duration=_window_from_config(window_cfg_str),
+                    seed=config.prng_seed,
+                )
+                if not windows:
+                    result.errors.append(
+                        f"No valid time windows for window size {window_cfg_str!r}; "
+                        "dataset may be empty or smaller than the window."
                     )
-                )
-            except Exception as exc:
-                logger.warning("Warmup error (db=%s op=%s iter=%d): %s", adapter.name, self.name, i, exc)
+                    continue
 
-        # ---- Measurement ----
-        measurement_q = queries[config.warmup_iterations:]
-        measurement_timings: list[TimingResult] = []
-        for i, (sql, params) in enumerate(measurement_q[: config.measurement_rounds]):
-            try:
-                _, timing = await adapter.execute_query(sql, params)
-                measurement_timings.append(timing)
-                result.operation_results.append(
-                    OperationResult.from_timing(
-                        run_id=run_id,
-                        database_name=adapter.name,
-                        operation=self.name,
-                        phase="measurement",
-                        iteration=i,
-                        timing=timing,
+                queries = self._make_queries(schema, adapter.name, windows, config)
+
+                # ---- Warmup (always sequential — prime caches, not stress test) ----
+                for i, (sql, params) in enumerate(queries[: config.warmup_iterations]):
+                    try:
+                        _, timing = await adapter.execute_query(sql, params)
+                        result.operation_results.append(
+                            OperationResult.from_timing(
+                                run_id=run_id,
+                                database_name=adapter.name,
+                                operation=operation,
+                                phase="warmup",
+                                iteration=i,
+                                timing=timing,
+                                workers=workers,
+                            )
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Warmup error (db=%s op=%s iter=%d): %s",
+                            adapter.name, operation, i, exc,
+                        )
+
+                # ---- Measurement ----
+                # Each round fires `workers` queries concurrently, each against its
+                # own distinct random window.  With workers=1 this is identical to
+                # the previous sequential behaviour.
+                measurement_timings: list[TimingResult] = []
+                warmup_n = config.warmup_iterations
+                op_index = 0
+                for i in range(config.measurement_rounds):
+                    batch = queries[warmup_n + i * workers : warmup_n + (i + 1) * workers]
+                    raw = await asyncio.gather(
+                        *[adapter.execute_query(sql, p) for sql, p in batch],
+                        return_exceptions=True,
                     )
-                )
-            except Exception as exc:
-                msg = f"Query error (db={adapter.name} op={self.name} iter={i}): {exc}"
-                logger.error(msg)
-                result.errors.append(msg)
+                    for item in raw:
+                        if isinstance(item, Exception):
+                            msg = (
+                                f"Query error (db={adapter.name} op={operation} "
+                                f"round={i} workers={workers}): {item}"
+                            )
+                            logger.error(msg)
+                            result.errors.append(msg)
+                            continue
+                        _, timing = item
+                        measurement_timings.append(timing)
+                        result.operation_results.append(
+                            OperationResult.from_timing(
+                                run_id=run_id,
+                                database_name=adapter.name,
+                                operation=operation,
+                                phase="measurement",
+                                iteration=op_index,
+                                timing=timing,
+                                workers=workers,
+                            )
+                        )
+                        op_index += 1
 
-        if measurement_timings:
-            result.summaries.append(
-                _build_summary(
-                    run_id=run_id,
-                    database_name=adapter.name,
-                    operation=self.name,
-                    batch_size=0,
-                    workers=1,
-                    timings=measurement_timings,
-                )
-            )
+                if measurement_timings:
+                    result.summaries.append(
+                        _build_summary(
+                            run_id=run_id,
+                            database_name=adapter.name,
+                            operation=operation,
+                            batch_size=0,
+                            workers=workers,
+                            timings=measurement_timings,
+                        )
+                    )
 
         return result
 
@@ -390,6 +490,10 @@ class LastPointBenchmark(_QueryBenchmarkBase):
 
     name = "last_point"
     description = "Retrieves the most recent metric value for each unique tag value."
+    # Does not filter on a time range — the query always scans the full table.
+    # Iterating multiple window sizes would repeat the same full-table query N times
+    # without adding any new information.
+    _iterate_time_windows = False
 
     def _make_queries(
         self,
@@ -534,6 +638,10 @@ class DownsamplingBenchmark(_QueryBenchmarkBase):
 
     name = "downsampling"
     description = "Multi-resolution time-series downsampling (1min / 1h / 1day)."
+    # Manages its own granularity cycling internally (_GRANULARITIES_* lists).
+    # Delegating window iteration to the base class would nest two separate
+    # cycling loops and produce confusing operation names.
+    _iterate_time_windows = False
 
     _GRANULARITIES_QUESTDB = ["1m", "1h", "1d"]
     _GRANULARITIES_DATE_BIN = ["1 minute", "1 hour", "1 day"]

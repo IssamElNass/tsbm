@@ -59,8 +59,6 @@ class MixedBenchmark:
         "reader coroutines run queries for a fixed duration."
     )
 
-    # Number of concurrent reader coroutines
-    _NUM_READERS = 4
     # Batch size for writer (small to keep latency low)
     _WRITE_BATCH_SIZE = 1000
     # Queue depth limit (backpressure)
@@ -92,122 +90,128 @@ class MixedBenchmark:
             )
             return result
 
-        # Shared queue and stop event
-        queue: asyncio.Queue = asyncio.Queue(maxsize=self._QUEUE_MAXSIZE)
-        stop_event = asyncio.Event()
+        workers_list: list[int] = config.workers if config.workers else [4]
 
-        write_timings: list[TimingResult] = []
-        read_timings: list[TimingResult] = []
-        errors: list[str] = []
+        for num_readers in workers_list:
+            # Fresh queue and stop event for each concurrency level
+            queue: asyncio.Queue = asyncio.Queue(maxsize=self._QUEUE_MAXSIZE)
+            stop_event = asyncio.Event()
 
-        async def _writer() -> None:
-            row_offset = 0
-            table_len = len(table)
-            while not stop_event.is_set():
-                batch_end = min(row_offset + self._WRITE_BATCH_SIZE, table_len)
-                batch = table.slice(row_offset, batch_end - row_offset)
-                row_offset = batch_end % table_len  # wrap around
+            write_timings: list[TimingResult] = []
+            read_timings: list[TimingResult] = []
+            errors: list[str] = []
 
-                try:
-                    with timed_operation(
-                        rows=len(batch),
-                        bytes_count=estimate_table_bytes(batch),
-                        disable_gc=False,
-                    ) as t:
-                        await adapter.ingest_batch(batch, table_name)
-                    write_timings.append(t)
-                    # Notify readers that new data is available
+            async def _writer() -> None:
+                row_offset = 0
+                table_len = len(table)
+                while not stop_event.is_set():
+                    batch_end = min(row_offset + self._WRITE_BATCH_SIZE, table_len)
+                    batch = table.slice(row_offset, batch_end - row_offset)
+                    row_offset = batch_end % table_len  # wrap around
+
                     try:
-                        queue.put_nowait("new_data")
-                    except asyncio.QueueFull:
-                        pass  # readers are busy; drop notification
-                except Exception as exc:
-                    errors.append(f"Writer error: {exc}")
-                    await asyncio.sleep(0.1)
+                        with timed_operation(
+                            rows=len(batch),
+                            bytes_count=estimate_table_bytes(batch),
+                            disable_gc=False,
+                        ) as t:
+                            await adapter.ingest_batch(batch, table_name)
+                        write_timings.append(t)
+                        # Notify readers that new data is available
+                        try:
+                            queue.put_nowait("new_data")
+                        except asyncio.QueueFull:
+                            pass  # readers are busy; drop notification
+                    except Exception as exc:
+                        errors.append(f"Writer error: {exc}")
+                        await asyncio.sleep(0.1)
 
-        async def _reader(reader_id: int) -> None:
-            rng = np.random.default_rng(config.prng_seed + reader_id)
-            while not stop_event.is_set():
-                # Wait for a notification (or timeout to avoid busy-spin)
-                try:
-                    await asyncio.wait_for(queue.get(), timeout=0.5)
-                    queue.task_done()
-                except asyncio.TimeoutError:
-                    if stop_event.is_set():
-                        break
-                    continue
+            async def _reader(reader_id: int) -> None:
+                rng = np.random.default_rng(config.prng_seed + reader_id)
+                while not stop_event.is_set():
+                    # Wait for a notification (or timeout to avoid busy-spin)
+                    try:
+                        await asyncio.wait_for(queue.get(), timeout=0.5)
+                        queue.task_done()
+                    except asyncio.TimeoutError:
+                        if stop_event.is_set():
+                            break
+                        continue
 
-                # Pick a random query
-                sql, params = query_pool[int(rng.integers(len(query_pool)))]
-                try:
-                    with timed_operation(rows=0, disable_gc=False) as t:
-                        _, _ = await adapter.execute_query(sql, params)
-                    read_timings.append(t)
-                except Exception as exc:
-                    errors.append(f"Reader {reader_id} error: {exc}")
+                    # Pick a random query
+                    sql, params = query_pool[int(rng.integers(len(query_pool)))]
+                    try:
+                        with timed_operation(rows=0, disable_gc=False) as t:
+                            _, _ = await adapter.execute_query(sql, params)
+                        read_timings.append(t)
+                    except Exception as exc:
+                        errors.append(f"Reader {reader_id} error: {exc}")
 
-        # Run writer + readers concurrently for duration_s
-        async def _stopper() -> None:
-            await asyncio.sleep(duration_s)
-            stop_event.set()
+            # Run writer + readers concurrently for duration_s
+            async def _stopper() -> None:
+                await asyncio.sleep(duration_s)
+                stop_event.set()
 
-        tasks = [
-            asyncio.create_task(_writer()),
-            asyncio.create_task(_stopper()),
-            *[asyncio.create_task(_reader(i)) for i in range(self._NUM_READERS)],
-        ]
+            tasks = [
+                asyncio.create_task(_writer()),
+                asyncio.create_task(_stopper()),
+                *[asyncio.create_task(_reader(i)) for i in range(num_readers)],
+            ]
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Record all timings as OperationResult
-        for i, t in enumerate(write_timings):
-            result.operation_results.append(
-                OperationResult.from_timing(
-                    run_id=run_id,
-                    database_name=adapter.name,
-                    operation="mixed_write",
-                    phase="measurement",
-                    iteration=i,
-                    timing=t,
+            # Record all timings as OperationResult
+            for i, t in enumerate(write_timings):
+                result.operation_results.append(
+                    OperationResult.from_timing(
+                        run_id=run_id,
+                        database_name=adapter.name,
+                        operation="mixed_write",
+                        phase="measurement",
+                        iteration=i,
+                        timing=t,
+                        workers=1,
+                    )
                 )
-            )
-        for i, t in enumerate(read_timings):
-            result.operation_results.append(
-                OperationResult.from_timing(
-                    run_id=run_id,
-                    database_name=adapter.name,
-                    operation="mixed_read",
-                    phase="measurement",
-                    iteration=i,
-                    timing=t,
+            for i, t in enumerate(read_timings):
+                result.operation_results.append(
+                    OperationResult.from_timing(
+                        run_id=run_id,
+                        database_name=adapter.name,
+                        operation="mixed_read",
+                        phase="measurement",
+                        iteration=i,
+                        timing=t,
+                        workers=num_readers,
+                    )
                 )
-            )
 
-        # Build summaries
-        if write_timings:
-            result.summaries.append(
-                _build_summary(
-                    run_id=run_id,
-                    database_name=adapter.name,
-                    operation="mixed_write",
-                    batch_size=self._WRITE_BATCH_SIZE,
-                    workers=1,
-                    timings=write_timings,
+            # Build summaries
+            if write_timings:
+                result.summaries.append(
+                    _build_summary(
+                        run_id=run_id,
+                        database_name=adapter.name,
+                        operation="mixed_write",
+                        batch_size=self._WRITE_BATCH_SIZE,
+                        workers=1,
+                        timings=write_timings,
+                    )
                 )
-            )
-        if read_timings:
-            result.summaries.append(
-                _build_summary(
-                    run_id=run_id,
-                    database_name=adapter.name,
-                    operation="mixed_read",
-                    batch_size=0,
-                    workers=self._NUM_READERS,
-                    timings=read_timings,
+            if read_timings:
+                result.summaries.append(
+                    _build_summary(
+                        run_id=run_id,
+                        database_name=adapter.name,
+                        operation="mixed_read",
+                        batch_size=0,
+                        workers=num_readers,
+                        timings=read_timings,
+                    )
                 )
-            )
 
-        result.errors.extend(errors)
+            result.errors.extend(errors)
+
         return result
 
     def get_queries(

@@ -55,39 +55,62 @@ chunk_time_interval  = "7 days"
 [workload]
 
 # Dataset file used by all benchmarks unless overridden with --dataset.
-# Swap in a pre-generated Parquet file for large-scale runs (see header above).
-dataset = "datasets/small_iot.csv"
+# Change this to point at your pre-generated Parquet file.
+dataset = "datasets/40m.parquet"
 
 # ── Ingestion batch sweep ──────────────────────────────────────────────────────
-# Each value is tested independently during the ingestion benchmarks.
-# Larger batches amortise per-call overhead; very small batches stress
-# the commit/WAL path.  Batch sizes larger than the dataset are capped
-# to the dataset size automatically.
+# Each batch_size value is tested independently during ingestion benchmarks.
+# Larger batches amortise per-call overhead; very small batches stress the
+# commit/WAL path.  Batch sizes larger than the dataset are capped automatically.
 #
-# Tuning guide:
-#   ~100 K rows   →  [1_000, 10_000, 50_000, 100_000]
-#   ~11 M rows    →  [10_000, 100_000, 500_000, 1_000_000]
-#   ~100 M rows   →  [50_000, 500_000, 2_000_000, 10_000_000]
-# For ~30 M row datasets on a laptop, keep batch_sizes ≤ 500_000 and
-# workers ≤ 4 to avoid RAM exhaustion (each sub-batch lives in memory
-# simultaneously: workers × batch_size × ~70 bytes).
-batch_sizes = [10_000, 100_000, 500_000]
+# Scale guide (pick the section that matches your dataset):
+#
+#   ~100 K rows (quick smoke-test):
+#     batch_sizes = [1_000, 10_000, 50_000]
+#     workers     = [1, 4, 8]
+#     warmup_iterations  = 3
+#     measurement_rounds = 10
+#
+#   ~11 M rows (standard IoT fleet):
+#     batch_sizes = [10_000, 100_000, 500_000]
+#     workers     = [1, 4, 8]
+#     warmup_iterations  = 3
+#     measurement_rounds = 10
+#
+#   ~40 M rows (current test — configured below):
+#     batch_sizes = [50_000, 500_000, 2_000_000]
+#     workers     = [1, 2, 4]
+#     warmup_iterations  = 2
+#     measurement_rounds = 5
+#
+#   ~100 M rows (stress / capacity test):
+#     batch_sizes = [100_000, 1_000_000, 5_000_000]
+#     workers     = [1, 2, 4]
+#     warmup_iterations  = 1
+#     measurement_rounds = 3
+#
+# Memory budget: workers × batch_size × ~70 bytes live in RAM simultaneously.
+#   4 workers × 2 M rows × 70 bytes ≈ 560 MB  ← safe on 8 GB machines
+#   4 workers × 5 M rows × 70 bytes ≈ 1.4 GB  ← safe on 16 GB machines
+batch_sizes = [50_000, 500_000, 2_000_000]
 
-# Number of concurrent writer tasks per batch.
-# Reduce to [1, 2, 4] on machines with < 16 GB RAM.
-workers = [1, 4, 8]
+# Concurrency level swept across all benchmarks:
+#   Ingestion        — N concurrent writer tasks per batch
+#   Query benchmarks — N concurrent client queries per measurement round
+#   Mixed            — N concurrent reader coroutines (writer is always 1)
+workers = [1, 4, 8, 16]
 
 # Warmup iterations executed (and discarded) before measurement begins.
-# Warms caches, JIT, and connection pools.
-# Reduce to 2–3 for very large datasets to save time.
-warmup_iterations = 3
+warmup_iterations = 2
 
 # Measurement rounds per (batch_size × workers) combination.
-# Every round re-inserts one full batch, so total rows = batch_size × rounds.
-# Reduce for 100 M-row datasets (5 rounds is sufficient for stable statistics).
-measurement_rounds = 10
+# 5 rounds gives stable p50/p95/p99 statistics for large datasets.
+measurement_rounds = 5
 
-# Time windows used by the query benchmarks (time_range, downsampling).
+# Time windows used by the query benchmarks (time_range, aggregation, etc.).
+# Each window is benchmarked independently, producing per-window results.
+# For sparse datasets (few rows per minute), narrow windows scan fewer rows
+# and finish faster; wide windows stress sequential scan performance.
 time_windows = ["1min", "1h", "1day", "1week"]
 
 # Seed for reproducible random time-window generation.
@@ -97,27 +120,37 @@ prng_seed = 42
 mixed_duration_seconds = 60
 
 # Whether to truncate the table between every measurement round.
-# false = rows accumulate (tests write-under-load);
-# true  = isolated fresh-table measurement (more reproducible, slower overall).
+# false = rows accumulate (tests write-under-load — recommended for large datasets);
+# true  = isolated fresh-table measurement (more reproducible but much slower overall
+#          because the full dataset is re-loaded before every round).
 reset_between_rounds = false
 
 # ── Streaming ─────────────────────────────────────────────────────────────────
-# When the dataset row count exceeds this threshold the run command automatically
-# switches to streaming mode — rows are fed to the database in chunks rather
-# than loading the whole file into RAM at once.  Schema is inferred from the
-# first 50 K rows so the full file is never read eagerly.
+# Datasets exceeding this row count are fed to the database chunk-by-chunk
+# rather than loading the whole file into RAM at once.
+# Query benchmarks read only the timestamp column for window generation
+# (not the full table), so peak memory during query runs is kept low.
 #
 # Rule of thumb:
-#   8 GB laptop, 30 M rows  → 500_000  (chunks keep peak RAM < 200 MB)
-#   16 GB desktop            → 2_000_000
-#   32 GB+ server            → 5_000_000+
+#   8 GB  machine → 500_000   (each 100 K chunk ≈ 7 MB @ 70 bytes/row)
+#   16 GB machine → 2_000_000
+#   32 GB machine → 5_000_000
 streaming_threshold_rows = 500_000
 
 # Rows per streaming chunk.
-# Lower = less RAM per chunk but more round-trips.  50 K–200 K is a good
-# range for laptops with 8–16 GB RAM.
-# At ~70 bytes/row:  50_000 rows ≈ 3.5 MB  |  200_000 rows ≈ 14 MB per chunk.
-chunk_size = 100_000
+# Larger = fewer round-trips, better ingestion throughput, more RAM per chunk.
+# At ~70 bytes/row:
+#   100_000 rows ≈  7 MB per chunk
+#   500_000 rows ≈ 35 MB per chunk
+chunk_size = 500_000
+
+# ── Timestamp column override ─────────────────────────────────────────────────
+# By default the timestamp column is auto-detected by name (time, ts, timestamp,
+# datetime, date, created_at, event_time) or by PyArrow type.
+# Set this when your dataset uses a different column name (e.g. "recorded_at").
+# Can also be overridden at runtime with:  tsbm run --timestamp-col my_col
+#
+# timestamp_col = "recorded_at"
 
 # ── Query column overrides ────────────────────────────────────────────────────
 # By default every aggregation and GROUP BY uses the first metric / tag column
