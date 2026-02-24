@@ -93,6 +93,11 @@ class WorkloadConfig(BaseModel):
     # 0 = disabled (default).  Only effective when reset_between_rounds = false;
     # if reset_between_rounds = true the seed is wiped at the start of each round.
     ingestion_seed_rows: int = 0
+    # Explicit timestamp column name. Leave empty ("") for auto-detection.
+    # Set this when the dataset's timestamp column has a non-standard name
+    # (i.e. not one of: time, ts, timestamp, datetime, date, created_at, event_time).
+    # Can also be overridden at runtime with --timestamp-col on the CLI.
+    timestamp_col: str = ""
 
 
 # ---------------------------------------------------------------------------

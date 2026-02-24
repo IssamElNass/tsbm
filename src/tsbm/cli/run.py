@@ -121,6 +121,7 @@ async def async_run(
     benchmark_name: str,
     config_path: Path | None,
     dataset_path: Path | None,
+    timestamp_col: str | None = None,
 ) -> None:
     """Full orchestration for the ``tsbm run`` command."""
 
@@ -189,9 +190,17 @@ async def async_run(
         dataset._unit_conversions = dict(settings.workload.unit_conversions)
         console.print(f"  Unit conversions (streaming mode): {dict(settings.workload.unit_conversions)}")
 
+    # Apply timestamp column override: CLI flag takes precedence over toml setting.
+    effective_ts_col = timestamp_col or settings.workload.timestamp_col or ""
+    if effective_ts_col:
+        from tsbm.datasets.loader import override_timestamp_col
+        dataset = override_timestamp_col(dataset, effective_ts_col)
+        console.print(f"  Timestamp column overridden: [bold]{effective_ts_col}[/bold]")
+
     console.print(
         f"  Schema: [bold]{dataset.schema.name}[/bold] "
         f"({dataset.schema.row_count:,} rows, "
+        f"ts=[bold]{dataset.schema.timestamp_col}[/bold], "
         f"tags={dataset.schema.tag_cols}, "
         f"metrics={dataset.schema.metric_cols})"
     )

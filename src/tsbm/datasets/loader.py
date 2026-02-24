@@ -187,6 +187,66 @@ def load_dataset_streaming(
     )
 
 
+def override_timestamp_col(
+    dataset: BenchmarkDataset,
+    col_name: str,
+) -> BenchmarkDataset:
+    """
+    Override the auto-detected timestamp column in a :class:`BenchmarkDataset`.
+
+    Use this when the dataset's timestamp column has a non-standard name that
+    was not picked up by auto-detection (name hints or PyArrow type).
+
+    The previously detected timestamp column is demoted to role ``OTHER``.
+    The new column is promoted to ``TIMESTAMP`` and normalised to
+    ``timestamp[ns, tz=UTC]`` if the table is already in memory.
+
+    Parameters
+    ----------
+    dataset:
+        The loaded (or streaming) dataset to modify in-place.
+    col_name:
+        Name of the column to use as the primary timestamp.
+
+    Raises
+    ------
+    SchemaError
+        If *col_name* is not present in the dataset schema.
+    """
+    col_names = [c.name for c in dataset.schema.columns]
+    if col_name not in col_names:
+        raise SchemaError(
+            f"Timestamp column override {col_name!r} not found in dataset. "
+            f"Available columns: {col_names}"
+        )
+    if dataset.schema.timestamp_col == col_name:
+        return dataset  # already correct — nothing to do
+
+    old_ts_name = dataset.schema.timestamp_col
+
+    # Re-classify columns: demote old timestamp, promote new one
+    new_columns = []
+    for spec in dataset.schema.columns:
+        if spec.name == old_ts_name:
+            new_columns.append(ColumnSpec(spec.name, ColumnRole.OTHER, spec.arrow_type))
+        elif spec.name == col_name:
+            new_columns.append(ColumnSpec(spec.name, ColumnRole.TIMESTAMP, spec.arrow_type))
+        else:
+            new_columns.append(spec)
+
+    dataset.schema.timestamp_col = col_name
+    dataset.schema.columns = new_columns
+
+    # Normalise the new timestamp column if the table is already in memory.
+    # Streaming datasets have table=None; they are normalised chunk-by-chunk during
+    # ingestion/iteration so no action is needed here.
+    if dataset.table is not None:
+        dataset.table = normalize_timestamp_column(dataset.table, col_name)
+
+    logger.info("Timestamp column overridden: %r → %r", old_ts_name, col_name)
+    return dataset
+
+
 def estimate_row_count(path: Path) -> int:
     """
     Cheaply estimate the number of rows in *path* without reading the full file.

@@ -68,6 +68,17 @@ def cmd_run(
         Optional[Path],
         typer.Option("--dataset", help="Override dataset path from config."),
     ] = None,
+    timestamp_col: Annotated[
+        Optional[str],
+        typer.Option(
+            "--timestamp-col",
+            help=(
+                "Name of the timestamp column in the dataset. "
+                "Overrides auto-detection. Use this when your column is not named "
+                "one of: time, ts, timestamp, datetime, date, created_at, event_time."
+            ),
+        ),
+    ] = None,
     verbose: Annotated[
         bool,
         typer.Option("--verbose", "-v", help="Enable debug logging."),
@@ -80,6 +91,7 @@ def cmd_run(
         benchmark_name=benchmark,
         config_path=config,
         dataset_path=dataset,
+        timestamp_col=timestamp_col,
     ))
 
 

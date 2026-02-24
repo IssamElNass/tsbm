@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
+import pyarrow.compute as pc
 
 from tsbm.benchmarks.base import BenchmarkResult
 from tsbm.benchmarks.ingestion import _build_summary
@@ -89,19 +90,23 @@ def _random_windows(
     """
     Generate *n* random non-overlapping time windows within the dataset range.
     """
-    ts_array = table.column(ts_col).to_pylist()
-    ts_sorted = sorted(t for t in ts_array if t is not None)
-    if len(ts_sorted) < 2:
-        return []
-
     # Ensure tz-aware datetime objects
     def _to_aware(dt: Any) -> datetime:
         if isinstance(dt, datetime):
             return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         return datetime.fromtimestamp(dt / 1e9, tz=timezone.utc)
 
-    t_min = _to_aware(ts_sorted[0])
-    t_max = _to_aware(ts_sorted[-1])
+    # Use vectorized Arrow compute to find min/max — O(n) in C++, near-zero extra memory.
+    # Avoid .to_pylist() + sorted() which would materialise all N timestamps to Python
+    # objects and sort them in O(n log n), costing minutes on million-row datasets.
+    col = table.column(ts_col)
+    t_min_raw = pc.min(col).as_py()
+    t_max_raw = pc.max(col).as_py()
+    if t_min_raw is None or t_max_raw is None:
+        return []
+
+    t_min = _to_aware(t_min_raw)
+    t_max = _to_aware(t_max_raw)
     total_range = (t_max - t_min).total_seconds()
 
     if total_range <= window_duration.total_seconds():

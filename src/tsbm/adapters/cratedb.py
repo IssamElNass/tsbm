@@ -33,7 +33,6 @@ from tsbm.adapters.base import RETRYABLE_CONNECTION_EXCEPTIONS
 from tsbm.adapters.type_maps import (
     DB_CRATEDB,
     arrow_table_to_ddl,
-    cratedb_array_type,
 )
 from tsbm.config.settings import CrateDBConfig
 from tsbm.datasets.schema import ColumnRole, DatasetSchema
@@ -146,9 +145,12 @@ class CrateDBAdapter:
         """
         Bulk insert via CrateDB's UNNEST pattern.
 
-        All columns are passed as typed arrays using asyncpg's native
-        PostgreSQL parameter binding.  Type casts (``$1::TYPE[]``) are
-        required because CrateDB does not infer types from untyped arrays.
+        Type casts (``$1::TYPE[]``) are intentionally omitted from the UNNEST
+        parameters.  CrateDB's ``::`` cast operator only supports single-word
+        type names; multi-word names such as ``TIMESTAMP WITH TIME ZONE`` and
+        ``DOUBLE PRECISION`` confuse its ANTLR parser (``WITH`` is misread as
+        a CTE keyword, ``PRECISION`` as an unexpected token).  CrateDB infers
+        parameter types from the INSERT target column declarations instead.
         """
         if self._schema is None:
             raise IngestionError("call create_table() before ingest_batch()")
@@ -160,9 +162,7 @@ class CrateDBAdapter:
         # Build column lists and parameter arrays
         cols = [c for c in schema.columns]
         col_names = ", ".join(f'"{c.name}"' for c in cols)
-        unnest_parts = ", ".join(
-            f"${i + 1}::{cratedb_array_type(c)}" for i, c in enumerate(cols)
-        )
+        unnest_parts = ", ".join(f"${i + 1}" for i in range(len(cols)))
         sql = (
             f'INSERT INTO "{table_name}" ({col_names}) '
             f"SELECT * FROM UNNEST({unnest_parts})"

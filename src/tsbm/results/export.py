@@ -65,6 +65,45 @@ BENCHMARK_DESCRIPTIONS: dict[str, str] = {
 }
 
 
+DATABASE_DESCRIPTIONS: dict[str, str] = {
+    "questdb": (
+        "**Ingestion:** InfluxDB Line Protocol (ILP) over HTTP — bypasses SQL parsing "
+        "for the highest possible write throughput.\n"
+        "**Consistency:** immediate; all rows are visible as soon as the ILP batch is committed.\n"
+        "**Time-bucketing:** native `SAMPLE BY` clause (e.g. `SAMPLE BY 1h`) — no GROUP BY required.\n"
+        "**Last-point:** `LATEST ON ts PARTITION BY tag` — O(1) per partition via the timestamp index.\n"
+        "**Partitioning:** table is range-partitioned by time (`PARTITION BY DAY` by default); "
+        "time-range queries skip irrelevant partitions entirely, so short-window scans are very fast."
+    ),
+    "cratedb": (
+        "**Ingestion:** `INSERT … SELECT * FROM UNNEST($1, $2, …)` bulk insert over the "
+        "PostgreSQL wire protocol. Type casts (`::TYPE[]`) are omitted because CrateDB's ANTLR "
+        "parser misreads multi-word type names (`TIMESTAMP WITH TIME ZONE`, `DOUBLE PRECISION`); "
+        "types are inferred from the INSERT target column declarations instead.\n"
+        "**Consistency:** eventually consistent — a `REFRESH TABLE` is issued before every "
+        "query benchmark to force shard refresh (default refresh interval ~1 s).\n"
+        "**Time-bucketing:** `DATE_BIN('1 hour', ts, TIMESTAMP '1970-01-01')`.\n"
+        "**Last-point:** `ROW_NUMBER() OVER (PARTITION BY tag ORDER BY ts DESC)` window function "
+        "(CrateDB does not support PostgreSQL's `DISTINCT ON`).\n"
+        "**Materialized views:** simulated via a plain summary table; full re-population on refresh "
+        "(no incremental update)."
+    ),
+    "timescaledb": (
+        "**Ingestion:** PostgreSQL `COPY` protocol via asyncpg — the fastest ingest path "
+        "for standard PostgreSQL. The table is converted to a hypertable with "
+        "`SELECT create_hypertable(table, ts_col)`.\n"
+        "**Consistency:** immediate (standard PostgreSQL MVCC).\n"
+        "**Time-bucketing:** `time_bucket('1 hour', ts)` — a TimescaleDB extension function.\n"
+        "**Last-point:** `SELECT DISTINCT ON (tag) … ORDER BY tag, ts DESC`.\n"
+        "**Chunk interval:** the hypertable is partitioned into time chunks "
+        "(`chunk_time_interval`, default 7 days); queries touching fewer chunks run faster — "
+        "tune this to match your data frequency.\n"
+        "**Continuous aggregates:** native materialized views with incremental refresh "
+        "(only recomputes changed chunks)."
+    ),
+}
+
+
 # ---------------------------------------------------------------------------
 # CSV
 # ---------------------------------------------------------------------------
@@ -354,6 +393,18 @@ def export_full_report(
             f"| {r['benchmark_name']} | {r['database_name']} | {r['dataset_name']} "
             f"| {r['started_at']} | {completed} | `{r['run_id']}` |"
         )
+    lines.append("\n---\n")
+
+    # ---- Database Methodology ----
+    lines.append("## Database Methodology\n")
+    lines.append(
+        "> How each database ingests data, maintains consistency, and executes time-series queries.\n"
+    )
+    for db in databases:
+        desc = DATABASE_DESCRIPTIONS.get(db)
+        if desc:
+            lines.append(f"### {db}\n")
+            lines.append(f"{desc}\n")
     lines.append("\n---\n")
 
     # ---- Results ----
