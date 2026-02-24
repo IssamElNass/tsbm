@@ -174,7 +174,7 @@ def _questdb_ddl(table_name: str, col_defs: list[str], ts_col: str, partition_by
     return (
         f'CREATE TABLE IF NOT EXISTS "{table_name}" (\n'
         f"{cols}\n"
-        f") TIMESTAMP({ts_col}) PARTITION BY {partition_by};"
+        f') TIMESTAMP("{ts_col}") PARTITION BY {partition_by};'
     )
 
 
@@ -220,7 +220,15 @@ def cratedb_array_type(col: ColumnSpec) -> str:
     """
     Return the CrateDB SQL array cast type for use in UNNEST parameters.
 
-    E.g. ``TIMESTAMP WITH TIME ZONE[]``, ``TEXT[]``, ``DOUBLE PRECISION[]``.
+    Uses ``TIMESTAMPTZ[]`` instead of ``TIMESTAMP WITH TIME ZONE[]`` for
+    timestamp columns: the ``WITH`` keyword inside a ``::`` cast confuses
+    CrateDB's ANTLR parser, which tries to interpret it as a CTE clause
+    (``WITH [RECURSIVE] …``).  ``TIMESTAMPTZ`` is a supported single-word
+    alias in CrateDB 5.x (``crate:latest``).
+
+    E.g. ``TIMESTAMPTZ[]``, ``TEXT[]``, ``DOUBLE PRECISION[]``.
     """
+    if pa.types.is_timestamp(col.arrow_type) or pa.types.is_date(col.arrow_type):
+        return "TIMESTAMPTZ[]"
     base = get_db_type(col.arrow_type, col.role, DB_CRATEDB)
     return f"{base}[]"
