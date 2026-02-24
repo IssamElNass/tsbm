@@ -408,10 +408,15 @@ class LastPointBenchmark(_QueryBenchmarkBase):
                 )
                 queries.append((sql, ()))
             elif adapter_name == _DB_CRATEDB:
+                # CrateDB does not support DISTINCT ON (PostgreSQL-specific).
+                # Use a ROW_NUMBER() window function subquery instead.
                 sql = (
-                    f'SELECT DISTINCT ON ("{tag}") "{tag}", "{metric}", "{ts}" '
-                    f'FROM "{tbl}" '
-                    f'ORDER BY "{tag}", "{ts}" DESC'
+                    f'SELECT "{tag}", "{metric}", "{ts}" '
+                    f'FROM ('
+                    f'SELECT "{tag}", "{metric}", "{ts}", '
+                    f'ROW_NUMBER() OVER (PARTITION BY "{tag}" ORDER BY "{ts}" DESC) AS _rn '
+                    f'FROM "{tbl}"'
+                    f') _sub WHERE _rn = 1 ORDER BY "{tag}"'
                 )
                 queries.append((sql, ()))
             else:  # timescaledb
@@ -436,8 +441,10 @@ class LastPointBenchmark(_QueryBenchmarkBase):
             return [(self.name,
                 f'SELECT "{tag}", "{metric}", "{ts}" FROM "{tbl}" LATEST ON "{ts}" PARTITION BY "{tag}"')]
         return [(self.name,
-            f'SELECT DISTINCT ON ("{tag}") "{tag}", "{metric}", "{ts}" FROM "{tbl}" '
-            f'ORDER BY "{tag}", "{ts}" DESC')]
+            f'SELECT "{tag}", "{metric}", "{ts}" FROM ('
+            f'SELECT "{tag}", "{metric}", "{ts}", '
+            f'ROW_NUMBER() OVER (PARTITION BY "{tag}" ORDER BY "{ts}" DESC) AS _rn '
+            f'FROM "{tbl}") _sub WHERE _rn = 1 ORDER BY "{tag}"')]
 
 
 # ---------------------------------------------------------------------------
