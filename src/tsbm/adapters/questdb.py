@@ -223,9 +223,11 @@ class QuestDBAdapter:
                 )
                 continue
             except Exception as exc:
-                raise QueryError(f"QuestDB query failed: {exc}\nSQL: {sql}") from exc
+                raise QueryError(
+                    f"QuestDB query failed [{type(exc).__name__}: {exc}] SQL: {sql}"
+                ) from exc
         raise QueryError(
-            f"QuestDB query failed after 3 attempts: {last_exc}\nSQL: {sql}"
+            f"QuestDB query failed after 3 attempts [{type(last_exc).__name__}: {last_exc}] SQL: {sql}"
         ) from last_exc
 
     async def get_row_count(self, table_name: str) -> int:

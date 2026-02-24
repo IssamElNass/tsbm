@@ -378,11 +378,16 @@ class TimeRangeBenchmark(_QueryBenchmarkBase):
         queries = []
         for start, end in windows:
             if adapter_name == _DB_QUESTDB:
-                # QuestDB: use f-string with ISO timestamps (no $1 parameterisation)
+                # QuestDB: use f-string with ISO timestamps (no $1 parameterisation).
+                # Avoid SELECT * — asyncpg can fail to find type codecs for
+                # QuestDB-specific column types (e.g. SYMBOL) that appear in the
+                # RowDescription when the wildcard is expanded server-side.
+                # Explicit column list is functionally equivalent for the benchmark.
                 s = start.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 e = end.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                cols = ", ".join(f'"{col.name}"' for col in schema.columns)
                 sql = (
-                    f'SELECT * FROM "{tbl}" '
+                    f'SELECT {cols} FROM "{tbl}" '
                     f'WHERE "{ts}" >= \'{s}\' AND "{ts}" < \'{e}\''
                 )
                 queries.append((sql, ()))
