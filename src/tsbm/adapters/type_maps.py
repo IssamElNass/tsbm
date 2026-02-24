@@ -197,12 +197,18 @@ def _timescaledb_ddl(table_name: str, col_defs: list[str]) -> str:
 
 
 def _quote(name: str, db: str) -> str:
-    """Quote a column name if it clashes with reserved words."""
-    # 'timestamp' is a reserved word in PostgreSQL / CrateDB; quote it
-    reserved = {"timestamp", "time", "date", "value", "from", "to"}
-    if name.lower() in reserved and db != DB_QUESTDB:
-        return f'"{name}"'
-    return name
+    """
+    Quote a column name with SQL double-quotes.
+
+    CrateDB and TimescaleDB share PostgreSQL's large reserved-word set
+    (OFFSET, LIMIT, ORDER, KEY, INDEX, GROUP, …).  Always quoting is safer
+    than maintaining a whitelist and matches the quoting used everywhere else
+    in the adapters (UNNEST inserts, query templates, etc.).
+    QuestDB identifiers are left unquoted for compatibility with its parser.
+    """
+    if db == DB_QUESTDB:
+        return name
+    return f'"{name}"'
 
 
 # ---------------------------------------------------------------------------
