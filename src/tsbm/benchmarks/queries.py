@@ -43,6 +43,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _all_columns_sql(schema: "DatasetSchema") -> str:
+    """Build a quoted, comma-separated column list for SELECT (avoids SELECT *)."""
+    return ", ".join(f'"{c.name}"' for c in schema.columns)
+
+
 def _pick_metric(schema: "DatasetSchema", config: Any) -> str:
     """
     Return the metric column to use for aggregations.
@@ -375,19 +380,21 @@ class TimeRangeBenchmark(_QueryBenchmarkBase):
     ) -> list[tuple[str, tuple]]:
         tbl = schema.name
         ts = schema.timestamp_col
+        cols = _all_columns_sql(schema)
         queries = []
         for start, end in windows:
             if adapter_name == _DB_QUESTDB:
                 # QuestDB: use f-string with ISO timestamps (no $1 parameterisation)
+                # Explicit column list avoids asyncpg codec failures on SYMBOL columns.
                 s = start.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 e = end.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 sql = (
-                    f'SELECT * FROM "{tbl}" '
+                    f'SELECT {cols} FROM "{tbl}" '
                     f'WHERE "{ts}" >= \'{s}\' AND "{ts}" < \'{e}\''
                 )
                 queries.append((sql, ()))
             else:
-                sql = f'SELECT * FROM "{tbl}" WHERE "{ts}" >= $1 AND "{ts}" < $2'
+                sql = f'SELECT {cols} FROM "{tbl}" WHERE "{ts}" >= $1 AND "{ts}" < $2'
                 queries.append((sql, (start, end)))
         return queries
 
@@ -398,9 +405,10 @@ class TimeRangeBenchmark(_QueryBenchmarkBase):
     ) -> list[tuple[str, str]]:
         tbl = schema.name
         ts = schema.timestamp_col
+        cols = _all_columns_sql(schema)
         if adapter_name == _DB_QUESTDB:
-            return [(self.name, f'SELECT * FROM "{tbl}" WHERE "{ts}" >= \'<start>\' AND "{ts}" < \'<end>\'')]
-        return [(self.name, f'SELECT * FROM "{tbl}" WHERE "{ts}" >= $1 AND "{ts}" < $2')]
+            return [(self.name, f'SELECT {cols} FROM "{tbl}" WHERE "{ts}" >= \'<start>\' AND "{ts}" < \'<end>\'')]
+        return [(self.name, f'SELECT {cols} FROM "{tbl}" WHERE "{ts}" >= $1 AND "{ts}" < $2')]
 
 
 # ---------------------------------------------------------------------------

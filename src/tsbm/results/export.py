@@ -456,6 +456,245 @@ def export_full_report(
     return text
 
 
+# ---------------------------------------------------------------------------
+# Concise summary report
+# ---------------------------------------------------------------------------
+
+
+def export_summary_report(
+    summaries: list[dict[str, Any]],
+    run_metadata: list[dict[str, Any]],
+    output: Path | None = None,
+) -> str:
+    """
+    Generate a concise, conclusion-focused Markdown benchmark summary.
+
+    Unlike ``export_full_report``, this produces a short document (~50-80 lines)
+    highlighting key findings: throughput winners, query latency comparison,
+    concurrency scaling, and error/reliability status.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    databases = sorted({r["database_name"] for r in run_metadata})
+    dataset_names = sorted({r["dataset_name"] for r in run_metadata})
+    benchmark_names = _ordered_benchmarks(run_metadata)
+
+    # Build run_id → benchmark_name lookup
+    _run_to_bench: dict[str, str] = {r["run_id"]: r["benchmark_name"] for r in run_metadata}
+
+    # Group summaries by benchmark
+    bench_summaries: dict[str, list[dict[str, Any]]] = {}
+    for s in summaries:
+        bname = _run_to_bench.get(s.get("run_id", ""), "unknown")
+        bench_summaries.setdefault(bname, []).append(s)
+
+    lines: list[str] = []
+
+    # ---- Header ----
+    lines.append("# TSBM Benchmark Summary\n")
+    lines.append(
+        f"**Databases:** {', '.join(databases)}  "
+        f"**Dataset:** {', '.join(dataset_names)}  "
+        f"**Date:** {now}\n"
+    )
+    lines.append("---\n")
+
+    # ---- Ingestion Throughput ----
+    ingestion_rows = bench_summaries.get("ingestion", []) + bench_summaries.get("ingestion_out_of_order", [])
+    if ingestion_rows:
+        lines.append("## Ingestion Throughput\n")
+        # For each database, pick the best rows/sec across all batch/worker combos
+        db_best: dict[str, dict[str, Any]] = {}
+        for row in ingestion_rows:
+            db = row.get("database_name", "")
+            rps = row.get("rows_per_second_mean", 0) or 0
+            if db not in db_best or rps > (db_best[db].get("rows_per_second_mean", 0) or 0):
+                db_best[db] = row
+
+        ranked = sorted(db_best.items(), key=lambda x: x[1].get("rows_per_second_mean", 0) or 0, reverse=True)
+        lines.append("| Database | Rows/sec | MB/sec | p99 (ms) | Rank |")
+        lines.append("|---|---|---|---|---|")
+        for rank, (db, row) in enumerate(ranked, 1):
+            rps = row.get("rows_per_second_mean", 0) or 0
+            mbs = row.get("mb_per_second_mean", 0) or 0
+            p99 = row.get("latency_p99_ms", 0) or 0
+            label = f"**#{rank}**" if rank == 1 else f"#{rank}"
+            lines.append(f"| {db} | {rps:,.0f} | {mbs:.1f} | {p99:.1f} | {label} |")
+        lines.append("")
+
+    # ---- Query Latency (p99) ----
+    query_benchmarks = [b for b in benchmark_names if b not in _THROUGHPUT_BENCHMARKS]
+    if query_benchmarks and databases:
+        lines.append("## Query Latency (p99 ms)\n")
+        header = "| Benchmark | " + " | ".join(databases) + " | Fastest |"
+        sep = "| --- | " + " | ".join("---" for _ in databases) + " | --- |"
+        lines.append(header)
+        lines.append(sep)
+
+        for bench_name in query_benchmarks:
+            bench_rows = bench_summaries.get(bench_name, [])
+            if not bench_rows:
+                continue
+
+            # Group by operation, pick the representative one (best workers=1 or smallest window)
+            # For simplicity, aggregate: best p99 per database across all operations in this benchmark
+            db_p99: dict[str, float] = {}
+            for row in bench_rows:
+                db = row.get("database_name", "")
+                p99 = row.get("latency_p99_ms")
+                if p99 is not None:
+                    if db not in db_p99 or p99 < db_p99[db]:
+                        db_p99[db] = p99
+
+            if not db_p99:
+                continue
+
+            fastest_db = min(db_p99, key=db_p99.get)  # type: ignore[arg-type]
+            cells = [bench_name]
+            for db in databases:
+                val = db_p99.get(db)
+                cells.append(f"{val:.1f}" if val is not None else "—")
+            cells.append(f"**{fastest_db}**")
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.append("")
+
+    # ---- Concurrency Scaling ----
+    # Find a benchmark with multiple worker levels and show degradation
+    _scaling_bench = None
+    for candidate in ["aggregation", "time_range", "last_point"]:
+        rows = bench_summaries.get(candidate, [])
+        worker_vals = {r.get("workers", 1) for r in rows}
+        if len(worker_vals) >= 2:
+            _scaling_bench = candidate
+            break
+
+    if _scaling_bench:
+        lines.append("## Concurrency Scaling\n")
+        scale_rows = bench_summaries.get(_scaling_bench, [])
+        worker_levels = sorted({r.get("workers", 1) for r in scale_rows})
+
+        header_cols = ["Database"] + [f"{w}w (ms)" for w in worker_levels] + ["Degradation"]
+        lines.append("| " + " | ".join(header_cols) + " |")
+        lines.append("| " + " | ".join("---" for _ in header_cols) + " |")
+
+        for db in databases:
+            db_rows = [r for r in scale_rows if r.get("database_name") == db]
+            if not db_rows:
+                continue
+
+            # Best p99 per worker level for this db
+            worker_p99: dict[int, float] = {}
+            for row in db_rows:
+                w = row.get("workers", 1)
+                p99 = row.get("latency_p99_ms")
+                if p99 is not None:
+                    if w not in worker_p99 or p99 < worker_p99[w]:
+                        worker_p99[w] = p99
+
+            cells = [db]
+            for w in worker_levels:
+                val = worker_p99.get(w)
+                cells.append(f"{val:.1f}" if val is not None else "—")
+
+            # Degradation: max_workers / min_workers
+            min_w = min(worker_levels)
+            max_w = max(worker_levels)
+            if min_w in worker_p99 and max_w in worker_p99 and worker_p99[min_w] > 0:
+                degrad = worker_p99[max_w] / worker_p99[min_w]
+                cells.append(f"{degrad:.1f}x")
+            else:
+                cells.append("—")
+            lines.append("| " + " | ".join(cells) + " |")
+
+        lines.append(f"\n> Scaling benchmark: `{_scaling_bench}`\n")
+
+    # ---- Errors & Reliability ----
+    lines.append("## Errors & Reliability\n")
+    lines.append("| Database | Completed Runs | Failed Runs | Status |")
+    lines.append("|---|---|---|---|")
+    for db in databases:
+        db_runs = [r for r in run_metadata if r["database_name"] == db]
+        completed = sum(1 for r in db_runs if r.get("completed_at"))
+        failed = len(db_runs) - completed
+        status = "Clean" if failed == 0 else f"{failed} failure(s)"
+        lines.append(f"| {db} | {completed} | {failed} | {status} |")
+    lines.append("")
+
+    # ---- Key Findings ----
+    lines.append("## Key Findings\n")
+    findings: list[str] = []
+
+    # Best ingestion
+    if ingestion_rows:
+        best_ing = max(ingestion_rows, key=lambda r: r.get("rows_per_second_mean", 0) or 0)
+        rps = best_ing.get("rows_per_second_mean", 0) or 0
+        findings.append(
+            f"**Fastest ingestion:** {best_ing['database_name']} "
+            f"({rps:,.0f} rows/sec)"
+        )
+
+    # Best query latency (lowest p99 across all query benchmarks)
+    all_query_rows = []
+    for b in query_benchmarks:
+        all_query_rows.extend(bench_summaries.get(b, []))
+    if all_query_rows:
+        valid = [r for r in all_query_rows if r.get("latency_p99_ms") is not None]
+        if valid:
+            best_q = min(valid, key=lambda r: r["latency_p99_ms"])
+            findings.append(
+                f"**Lowest query latency:** {best_q['database_name']} "
+                f"(p99 {best_q['latency_p99_ms']:.1f} ms on {best_q.get('operation', '?')})"
+            )
+
+    # Best concurrency scaling
+    if _scaling_bench:
+        scale_rows = bench_summaries.get(_scaling_bench, [])
+        min_w = min(worker_levels)
+        max_w = max(worker_levels)
+        best_degrad = None
+        best_degrad_db = None
+        for db in databases:
+            db_rows = [r for r in scale_rows if r.get("database_name") == db]
+            w_p99: dict[int, float] = {}
+            for row in db_rows:
+                w = row.get("workers", 1)
+                p99 = row.get("latency_p99_ms")
+                if p99 is not None:
+                    if w not in w_p99 or p99 < w_p99[w]:
+                        w_p99[w] = p99
+            if min_w in w_p99 and max_w in w_p99 and w_p99[min_w] > 0:
+                d = w_p99[max_w] / w_p99[min_w]
+                if best_degrad is None or d < best_degrad:
+                    best_degrad = d
+                    best_degrad_db = db
+        if best_degrad_db and best_degrad:
+            findings.append(
+                f"**Best concurrency scaling:** {best_degrad_db} "
+                f"({best_degrad:.1f}x degradation from {min_w} to {max_w} workers)"
+            )
+
+    # Mixed benchmark summary
+    mixed_rows = bench_summaries.get("mixed", [])
+    if mixed_rows:
+        valid_mixed = [r for r in mixed_rows if r.get("rows_per_second_mean")]
+        if valid_mixed:
+            best_mixed = max(valid_mixed, key=lambda r: r.get("rows_per_second_mean", 0) or 0)
+            findings.append(
+                f"**Best mixed read/write:** {best_mixed['database_name']} "
+                f"({best_mixed.get('rows_per_second_mean', 0):,.0f} rows/sec under concurrent load)"
+            )
+
+    for i, finding in enumerate(findings, 1):
+        lines.append(f"{i}. {finding}")
+
+    lines.append("")
+
+    text = "\n".join(lines)
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(text, encoding="utf-8")
+    return text
+
+
 def _ordered_benchmarks(run_metadata: list[dict[str, Any]]) -> list[str]:
     """Return benchmark names in a logical order (throughput first, then query benchmarks)."""
     seen = {r["benchmark_name"] for r in run_metadata}

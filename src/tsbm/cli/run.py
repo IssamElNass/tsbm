@@ -41,14 +41,17 @@ from rich.progress import (
 from rich.table import Table
 
 from tsbm.adapters.registry import get_enabled_adapters
-from tsbm.benchmarks.registry import get_workload, list_workloads
+from tsbm.benchmarks.registry import get_workload, list_default_workloads, list_workloads
 from tsbm.config.settings import get_settings, load_settings_from_file
 from tsbm.datasets.loader import (
     apply_unit_conversions,
     estimate_row_count,
+    infer_schema_from_azure,
     infer_schema_from_sample,
     load_dataset,
     load_dataset_streaming,
+    load_multi_dataset_streaming,
+    resolve_dataset_sources,
 )
 from tsbm.environment.capture import capture_environment, enrich_db_versions
 from tsbm.exceptions import ConfigError
@@ -211,6 +214,7 @@ async def async_run(
     config_path: Path | None,
     dataset_path: Path | None,
     timestamp_col: str | None = None,
+    dataset_list: list[str] | None = None,
 ) -> None:
     """Full orchestration for the ``tsbm run`` command."""
 
@@ -225,13 +229,19 @@ async def async_run(
     known = list_workloads()
     if benchmark_name == "all":
         workload_names = known
+    elif benchmark_name == "default":
+        workload_names = list_default_workloads()
     else:
         if benchmark_name not in known:
             raise ConfigError(
                 f"Unknown benchmark {benchmark_name!r}. "
-                f"Available: {', '.join(known)}, all"
+                f"Available: {', '.join(known)}, default, all"
             )
         workload_names = [benchmark_name]
+
+    # CLI --dataset (multiple) overrides config datasets list
+    if dataset_list:
+        settings.workload.datasets = dataset_list
 
     effective_dataset = dataset_path or settings.workload.dataset
 
@@ -244,31 +254,72 @@ async def async_run(
     ).hexdigest()[:8]
 
     # ----------------------------------------------------------------
-    # 3. Dataset — auto-switch to streaming for large files
+    # 3. Dataset — multi-source or single file, auto-stream for large files
     # ----------------------------------------------------------------
-    effective_dataset_path = Path(effective_dataset)
-    console.print(f"[cyan]Loading dataset:[/cyan] {effective_dataset_path}")
+    use_multi = bool(settings.workload.datasets) and not dataset_path
+    azure_conn = settings.workload.azure_storage_connection_string
+    azure_sas = settings.workload.azure_storage_sas_token
 
-    n_rows_est = estimate_row_count(effective_dataset_path)
-    streaming_threshold = settings.workload.streaming_threshold_rows
+    if use_multi:
+        # Multi-source mode: multiple local files, globs, and/or Azure URLs
+        sources = resolve_dataset_sources(
+            settings.workload.datasets,
+            azure_connection_string=azure_conn,
+            azure_sas_token=azure_sas,
+        )
+        console.print(f"[cyan]Loading {len(sources)} dataset source(s):[/cyan]")
+        for src in sources:
+            console.print(f"  [dim]{src}[/dim]")
 
-    if n_rows_est > streaming_threshold:
-        console.print(
-            f"  [dim]~{n_rows_est:,} rows > streaming threshold {streaming_threshold:,} "
-            f"— using streaming mode (chunk_size={settings.workload.chunk_size:,})[/dim]"
-        )
-        schema_hint = infer_schema_from_sample(
-            effective_dataset_path,
-            sample_rows=min(50_000, n_rows_est),
-            tag_cardinality_threshold=settings.workload.tag_cardinality_threshold,
-        )
-        dataset = load_dataset_streaming(
-            effective_dataset_path,
+        # Infer schema from first available source
+        from tsbm.datasets.loader import _is_azure_url
+        first_local = next((s for s in sources if isinstance(s, Path)), None)
+        if first_local:
+            schema_hint = infer_schema_from_sample(
+                first_local,
+                tag_cardinality_threshold=settings.workload.tag_cardinality_threshold,
+            )
+        else:
+            # All sources are Azure — infer from first URL
+            schema_hint = infer_schema_from_azure(
+                str(sources[0]),
+                tag_cardinality_threshold=settings.workload.tag_cardinality_threshold,
+                connection_string=azure_conn,
+                sas_token=azure_sas,
+            )
+
+        dataset = load_multi_dataset_streaming(
+            sources,
             schema_hint=schema_hint,
             chunk_size=settings.workload.chunk_size,
+            azure_connection_string=azure_conn,
+            azure_sas_token=azure_sas,
         )
     else:
-        dataset = load_dataset(effective_dataset_path)
+        # Single-file mode (original behavior)
+        effective_dataset_path = Path(effective_dataset)
+        console.print(f"[cyan]Loading dataset:[/cyan] {effective_dataset_path}")
+
+        n_rows_est = estimate_row_count(effective_dataset_path)
+        streaming_threshold = settings.workload.streaming_threshold_rows
+
+        if n_rows_est > streaming_threshold:
+            console.print(
+                f"  [dim]~{n_rows_est:,} rows > streaming threshold {streaming_threshold:,} "
+                f"— using streaming mode (chunk_size={settings.workload.chunk_size:,})[/dim]"
+            )
+            schema_hint = infer_schema_from_sample(
+                effective_dataset_path,
+                sample_rows=min(50_000, n_rows_est),
+                tag_cardinality_threshold=settings.workload.tag_cardinality_threshold,
+            )
+            dataset = load_dataset_streaming(
+                effective_dataset_path,
+                schema_hint=schema_hint,
+                chunk_size=settings.workload.chunk_size,
+            )
+        else:
+            dataset = load_dataset(effective_dataset_path)
 
     # Apply unit conversions if configured
     if settings.workload.unit_conversions and dataset.table is not None:

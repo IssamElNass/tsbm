@@ -53,20 +53,19 @@ def cmd_run(
         typer.Option(
             "--benchmark", "-b",
             help=(
-                "Workload to run, or 'all' to run every workload sequentially. "
-                "Available: ingestion, ingestion_out_of_order, time_range, aggregation, "
-                "last_point, high_cardinality, downsampling, mixed, "
-                "materialized_view, late_arrival, all."
+                "Workload to run. 'default' runs: ingestion, time_range, aggregation, "
+                "last_point, mixed, downsampling. 'all' runs every registered workload. "
+                "Or specify a single benchmark name."
             ),
         ),
-    ] = "ingestion",
+    ] = "default",
     config: Annotated[
         Optional[Path],
         typer.Option("--config", "-c", help="Path to benchmark.toml. Defaults to ./benchmark.toml."),
     ] = None,
     dataset: Annotated[
-        Optional[Path],
-        typer.Option("--dataset", help="Override dataset path from config."),
+        Optional[List[str]],
+        typer.Option("--dataset", help="Override dataset path(s). Repeat for multiple files. Supports globs and az:// URLs."),
     ] = None,
     timestamp_col: Annotated[
         Optional[str],
@@ -86,12 +85,16 @@ def cmd_run(
 ) -> None:
     """Run a benchmark workload against one or more databases."""
     _setup_logging(verbose)
+    # Single dataset path for backward compat; multiple datasets go via config
+    dataset_path = Path(dataset[0]) if dataset and len(dataset) == 1 else None
+    dataset_list = list(dataset) if dataset and len(dataset) > 1 else None
     asyncio.run(async_run(
         db_names=list(db) if db else None,
         benchmark_name=benchmark,
         config_path=config,
-        dataset_path=dataset,
+        dataset_path=dataset_path,
         timestamp_col=timestamp_col,
+        dataset_list=dataset_list,
     ))
 
 
@@ -225,12 +228,19 @@ def cmd_report(
             help="Auto-select most recent completed run per (benchmark, database). Default: on.",
         ),
     ] = True,
+    summary: Annotated[
+        bool,
+        typer.Option(
+            "--summary/--full",
+            help="Generate concise summary (default) or full detailed report.",
+        ),
+    ] = True,
     verbose: Annotated[
         bool,
         typer.Option("--verbose", "-v", help="Enable debug logging."),
     ] = False,
 ) -> None:
-    """Generate a comprehensive Markdown report of benchmark results with SQL queries."""
+    """Generate a Markdown benchmark report. Use --summary (default) for a concise conclusion or --full for all metrics and SQL queries."""
     _setup_logging(verbose)
     asyncio.run(async_report(
         run_ids=list(run_ids) if run_ids else None,
@@ -238,6 +248,7 @@ def cmd_report(
         output=output,
         config_path=config,
         latest=latest,
+        summary=summary,
     ))
 
 

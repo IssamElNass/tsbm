@@ -165,7 +165,7 @@ class TestQuestDBDDL:
 
     def test_contains_timestamp_partition(self) -> None:
         ddl = arrow_table_to_ddl(self._schema(), DB_QUESTDB, "sensors")
-        assert "TIMESTAMP(ts)" in ddl
+        assert 'TIMESTAMP("ts")' in ddl
         assert "PARTITION BY DAY" in ddl
 
     def test_symbol_for_tag_column(self) -> None:
@@ -275,7 +275,7 @@ class TestCrateDBArrayType:
         (pa.float64(),  ColumnRole.METRIC,    "DOUBLE PRECISION[]"),
         (pa.int64(),    ColumnRole.METRIC,    "BIGINT[]"),
         (pa.string(),   ColumnRole.TAG,       "TEXT[]"),
-        (TIMESTAMP_TYPE, ColumnRole.TIMESTAMP, "TIMESTAMP WITH TIME ZONE[]"),
+        (TIMESTAMP_TYPE, ColumnRole.TIMESTAMP, "TIMESTAMPTZ[]"),
         (pa.bool_(),    ColumnRole.METRIC,    "BOOLEAN[]"),
     ])
     def test_array_suffix_added(

@@ -17,6 +17,7 @@ If ``schema_hint`` is provided, its column roles override inference.
 """
 from __future__ import annotations
 
+import glob as globmod
 import json
 import logging
 import warnings
@@ -483,6 +484,210 @@ def _iter_json_batches(
                 buffer = []
     if buffer:
         yield pa.Table.from_pylist(buffer).to_batches(max_chunksize=chunk_size)[0]
+
+
+# ---------------------------------------------------------------------------
+# Multi-source & Azure helpers
+# ---------------------------------------------------------------------------
+
+
+_AZURE_URL_PREFIXES = ("az://", "abfs://", "abfss://")
+_AZURE_BLOB_HOST = ".blob.core.windows.net/"
+
+
+def _is_azure_url(source: str) -> bool:
+    """Return True if *source* looks like an Azure Blob Storage URL."""
+    s = source.lower()
+    return s.startswith(_AZURE_URL_PREFIXES) or _AZURE_BLOB_HOST in s
+
+
+def resolve_dataset_sources(
+    sources: list[str],
+    azure_connection_string: str = "",
+    azure_sas_token: str = "",
+) -> list[Path | str]:
+    """
+    Resolve a list of dataset source strings into concrete paths or URLs.
+
+    - Local paths are validated for existence.
+    - Glob patterns (containing ``*`` or ``?``) are expanded.
+    - Azure URLs are returned as-is (validated at read time).
+
+    Returns a list where each entry is a ``Path`` (local) or ``str`` (Azure URL).
+
+    Raises
+    ------
+    DatasetError
+        If a local path does not exist and is not a valid glob.
+    """
+    resolved: list[Path | str] = []
+    for src in sources:
+        if _is_azure_url(src):
+            resolved.append(src)
+        elif "*" in src or "?" in src:
+            # Glob pattern
+            matches = sorted(globmod.glob(src, recursive=True))
+            if not matches:
+                raise DatasetError(f"Glob pattern matched no files: {src!r}")
+            for m in matches:
+                p = Path(m)
+                if p.suffix.lower() in SUPPORTED_SUFFIXES:
+                    resolved.append(p)
+        else:
+            p = Path(src)
+            if not p.exists():
+                raise DatasetError(f"Dataset file not found: {p}")
+            resolved.append(p)
+
+    if not resolved:
+        raise DatasetError("No dataset sources resolved from the provided list")
+
+    return resolved
+
+
+def _iter_azure_batches(
+    url: str,
+    chunk_size: int,
+    connection_string: str = "",
+    sas_token: str = "",
+) -> Iterator[pa.RecordBatch]:
+    """
+    Stream Parquet batches from Azure Blob Storage.
+
+    Uses ``fsspec`` + ``adlfs`` to open the file as a seekable stream,
+    then PyArrow's ``ParquetFile`` reads batches without full download.
+
+    Authentication priority:
+      1. ``connection_string`` (explicit)
+      2. ``sas_token`` (explicit)
+      3. ``DefaultAzureCredential`` (auto-detected via ``adlfs``)
+    """
+    try:
+        import fsspec  # noqa: PLC0415
+    except ImportError:
+        raise DatasetError(
+            "Azure dataset support requires the 'azure' extra. "
+            "Install with: pip install tsbm[azure]"
+        ) from None
+
+    storage_options: dict[str, str] = {}
+    if connection_string:
+        storage_options["connection_string"] = connection_string
+    elif sas_token:
+        storage_options["sas_token"] = sas_token
+    # else: DefaultAzureCredential via adlfs (auto-detected)
+
+    try:
+        with fsspec.open(url, mode="rb", **storage_options) as f:
+            pf = pq.ParquetFile(f)
+            for batch in pf.iter_batches(batch_size=chunk_size):
+                yield batch
+    except Exception as exc:
+        raise DatasetError(
+            f"Failed to read Azure dataset {url!r}: {exc}"
+        ) from exc
+
+
+def _iter_multi_source_batches(
+    sources: list[Path | str],
+    chunk_size: int = 100_000,
+    azure_connection_string: str = "",
+    azure_sas_token: str = "",
+) -> Iterator[pa.RecordBatch]:
+    """
+    Yield ``RecordBatch`` objects from multiple sources sequentially.
+
+    Local files use the existing ``_iter_dataset_batches``.
+    Azure URLs use ``_iter_azure_batches`` for streaming without full download.
+    """
+    for source in sources:
+        if isinstance(source, Path):
+            yield from _iter_dataset_batches(source, chunk_size)
+        else:
+            # Azure URL
+            yield from _iter_azure_batches(
+                source, chunk_size, azure_connection_string, azure_sas_token
+            )
+
+
+def load_multi_dataset_streaming(
+    sources: list[Path | str],
+    schema_hint: DatasetSchema,
+    chunk_size: int = 100_000,
+    azure_connection_string: str = "",
+    azure_sas_token: str = "",
+) -> BenchmarkDataset:
+    """
+    Return a :class:`BenchmarkDataset` that streams from multiple sources.
+
+    The sources are iterated sequentially during ``iter_batches()``.
+    No data is read into memory until iteration begins.
+    """
+    # Estimate total row count from local sources
+    total_rows = 0
+    first_local = None
+    for src in sources:
+        if isinstance(src, Path):
+            if first_local is None:
+                first_local = src
+            total_rows += estimate_row_count(src)
+        # Azure sources: row count unknown until read
+
+    schema = DatasetSchema(
+        name=schema_hint.name,
+        timestamp_col=schema_hint.timestamp_col,
+        tag_cols=list(schema_hint.tag_cols),
+        metric_cols=list(schema_hint.metric_cols),
+        columns=list(schema_hint.columns),
+        row_count=total_rows,
+    )
+
+    logger.info(
+        "Multi-source streaming dataset: %d source(s), ~%s rows, chunk_size=%d",
+        len(sources),
+        total_rows or "unknown",
+        chunk_size,
+    )
+
+    return BenchmarkDataset(
+        schema=schema,
+        table=None,
+        source_path=first_local,  # for timestamp column reading
+        streaming=True,
+        chunk_size=chunk_size,
+        source_paths=list(sources),
+        _azure_connection_string=azure_connection_string,
+        _azure_sas_token=azure_sas_token,
+    )
+
+
+def infer_schema_from_azure(
+    url: str,
+    sample_rows: int = 50_000,
+    tag_cardinality_threshold: float = 0.05,
+    connection_string: str = "",
+    sas_token: str = "",
+) -> DatasetSchema:
+    """
+    Infer a ``DatasetSchema`` from the first rows of an Azure Parquet file.
+    """
+    batches = []
+    n_read = 0
+    for batch in _iter_azure_batches(url, sample_rows, connection_string, sas_token):
+        batches.append(batch)
+        n_read += len(batch)
+        if n_read >= sample_rows:
+            break
+
+    if not batches:
+        raise DatasetError(f"Azure dataset appears empty: {url!r}")
+
+    sample = pa.Table.from_batches(batches).slice(0, min(sample_rows, n_read))
+    from tsbm.datasets.timestamps import normalize_timestamp_column
+
+    schema = _infer_schema(sample, "multi_dataset", tag_cardinality_threshold)
+    sample = normalize_timestamp_column(sample, schema.timestamp_col)
+    return _infer_schema(sample, "multi_dataset", tag_cardinality_threshold)
 
 
 # ---------------------------------------------------------------------------

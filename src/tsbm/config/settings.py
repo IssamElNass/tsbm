@@ -99,6 +99,21 @@ class WorkloadConfig(BaseModel):
     # Can also be overridden at runtime with --timestamp-col on the CLI.
     timestamp_col: str = ""
 
+    # Multiple dataset sources: list of local paths, globs, or Azure Blob URLs.
+    # When set, these are concatenated in order during the seed phase.
+    # Each entry can be:
+    #   - A local file path: "datasets/part1.parquet"
+    #   - A glob pattern: "datasets/parts/*.parquet"
+    #   - An Azure Blob URL: "az://container/path/file.parquet"
+    #     or "https://account.blob.core.windows.net/container/file.parquet"
+    # When empty, falls back to the single `dataset` field.
+    datasets: list[str] = []
+
+    # Azure storage authentication (used when any dataset entry is an Azure URL).
+    # Priority: connection_string > sas_token > DefaultAzureCredential (auto).
+    azure_storage_connection_string: str = ""
+    azure_storage_sas_token: str = ""
+
 
 # ---------------------------------------------------------------------------
 # Results config

@@ -27,12 +27,13 @@ async def async_report(
     output: Path,
     config_path: Path | None,
     latest: bool,
+    summary: bool = True,
 ) -> None:
     """Generate a Markdown benchmark report and write it to *output*."""
     from tsbm.benchmarks.registry import all_workloads
     from tsbm.config.settings import get_settings, load_settings_from_file
     from tsbm.datasets.schema import DatasetSchema
-    from tsbm.results.export import export_full_report
+    from tsbm.results.export import export_full_report, export_summary_report
     from tsbm.results.storage import ResultStorage
 
     settings = load_settings_from_file(config_path) if config_path else get_settings()
@@ -79,55 +80,61 @@ async def async_report(
         return
 
     # ------------------------------------------------------------------
-    # 3. Build SQL sections from workload.get_queries()
+    # 3. Render and write the report
     # ------------------------------------------------------------------
-    workloads = all_workloads()
     adapter_names = sorted({r["database_name"] for r in run_metadata})
-    benchmark_names = sorted({r["benchmark_name"] for r in run_metadata})
 
-    sql_sections: dict[str, dict[str, list[tuple[str, str]]]] = {}
+    if summary:
+        report_text = export_summary_report(
+            summaries=summaries,
+            run_metadata=run_metadata,
+            output=output,
+        )
+    else:
+        # Full report: build SQL sections from workload.get_queries()
+        workloads = all_workloads()
+        benchmark_names = sorted({r["benchmark_name"] for r in run_metadata})
 
-    for bench_name in benchmark_names:
-        workload = workloads.get(bench_name)
-        if workload is None:
-            continue
+        sql_sections: dict[str, dict[str, list[tuple[str, str]]]] = {}
 
-        schema = _reconstruct_schema(run_metadata, bench_name)
-        if schema is None:
-            # Old run without schema in snapshot — skip SQL section
-            sql_sections[bench_name] = {}
-            logger.debug(
-                "No dataset_schema in config_snapshot for benchmark %r — SQL section skipped",
-                bench_name,
-            )
-            continue
+        for bench_name in benchmark_names:
+            workload = workloads.get(bench_name)
+            if workload is None:
+                continue
 
-        sql_sections[bench_name] = {}
-        for adapter_name in adapter_names:
-            try:
-                queries = workload.get_queries(schema, adapter_name)
-            except Exception as exc:
-                logger.warning(
-                    "get_queries failed for %s / %s: %s", bench_name, adapter_name, exc
+            schema = _reconstruct_schema(run_metadata, bench_name)
+            if schema is None:
+                sql_sections[bench_name] = {}
+                logger.debug(
+                    "No dataset_schema in config_snapshot for benchmark %r — SQL section skipped",
+                    bench_name,
                 )
-                queries = []
-            sql_sections[bench_name][adapter_name] = queries
+                continue
 
-    # ------------------------------------------------------------------
-    # 4. Render and write the report
-    # ------------------------------------------------------------------
-    report_text = export_full_report(
-        summaries=summaries,
-        run_metadata=run_metadata,
-        sql_sections=sql_sections,
-        output=output,
-    )
+            sql_sections[bench_name] = {}
+            for adapter_name in adapter_names:
+                try:
+                    queries = workload.get_queries(schema, adapter_name)
+                except Exception as exc:
+                    logger.warning(
+                        "get_queries failed for %s / %s: %s", bench_name, adapter_name, exc
+                    )
+                    queries = []
+                sql_sections[bench_name][adapter_name] = queries
+
+        report_text = export_full_report(
+            summaries=summaries,
+            run_metadata=run_metadata,
+            sql_sections=sql_sections,
+            output=output,
+        )
 
     n_benchmarks = len({r["benchmark_name"] for r in run_metadata})
     n_dbs = len(adapter_names)
     n_runs = len(run_metadata)
+    mode = "Summary" if summary else "Full"
     console.print(
-        f"[green]Report written:[/green] {output}  "
+        f"[green]{mode} report written:[/green] {output}  "
         f"[dim]({n_runs} runs, {n_benchmarks} benchmarks, {n_dbs} databases, "
         f"{len(report_text):,} chars)[/dim]"
     )

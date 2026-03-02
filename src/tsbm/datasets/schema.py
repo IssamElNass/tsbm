@@ -169,6 +169,11 @@ class BenchmarkDataset:
     _unit_conversions: dict[str, tuple[str, str]] = field(
         default_factory=dict, repr=False, compare=False
     )
+    # Multi-source support: list of Path (local) or str (Azure URL).
+    # When populated, iter_batches() iterates through all sources sequentially.
+    source_paths: list[Any] = field(default_factory=list, repr=False)
+    _azure_connection_string: str = field(default="", repr=False, compare=False)
+    _azure_sas_token: str = field(default="", repr=False, compare=False)
 
     def is_lazy(self) -> bool:
         return self.table is None
@@ -193,13 +198,25 @@ class BenchmarkDataset:
         """
         Yield Arrow tables in ``chunk_size`` row batches.
 
+        * **Multi-source mode** (``source_paths`` populated): iterates through
+          all sources sequentially (local files and Azure URLs).
         * **Streaming mode** (``streaming=True``): reads from disk chunk-by-chunk
           without loading the entire file into memory.  Requires ``source_path``
           to be set.
         * **Eager mode** (``streaming=False``): slices the in-memory table.
           Calls ``load()`` first if the table is not yet materialised.
         """
-        if self.streaming and self.source_path is not None:
+        if self.source_paths:
+            from tsbm.datasets.loader import _iter_multi_source_batches
+            for batch in _iter_multi_source_batches(
+                self.source_paths, self.chunk_size,
+                self._azure_connection_string, self._azure_sas_token,
+            ):
+                tbl = pa.Table.from_batches([batch]) if isinstance(batch, pa.RecordBatch) else batch
+                if self._unit_conversions:
+                    tbl = _apply_unit_conversions_table(tbl, self._unit_conversions)
+                yield tbl
+        elif self.streaming and self.source_path is not None:
             from tsbm.datasets.loader import _iter_dataset_batches
             for batch in _iter_dataset_batches(self.source_path, self.chunk_size):
                 tbl = pa.Table.from_batches([batch]) if isinstance(batch, pa.RecordBatch) else batch

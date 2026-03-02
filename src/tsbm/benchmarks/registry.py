@@ -81,6 +81,23 @@ def list_workloads() -> list[str]:
     return sorted(_WORKLOADS)
 
 
+# Curated set of core benchmarks that cover the key dimensions:
+# write speed, scan, aggregation, latest value, concurrent read+write, downsampling.
+_DEFAULT_WORKLOADS: list[str] = [
+    "ingestion",
+    "time_range",
+    "aggregation",
+    "last_point",
+    "mixed",
+    "downsampling",
+]
+
+
+def list_default_workloads() -> list[str]:
+    """Return the default (curated) benchmark set."""
+    return list(_DEFAULT_WORKLOADS)
+
+
 def all_workloads() -> dict[str, BenchmarkWorkload]:
     """Return a shallow copy of the full registry dict."""
     return dict(_WORKLOADS)
