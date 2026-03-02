@@ -60,13 +60,24 @@ dataset = "datasets/40m.parquet"
 
 # Multiple dataset sources (concatenated in order during seeding).
 # When set, these take priority over the single `dataset` field above.
-# Each entry can be a local path, glob pattern, or Azure Blob URL.
-# datasets = [
-#     "datasets/part1.parquet",
-#     "datasets/parts/*.parquet",
-#     "az://myblobcontainer/data/sensors_2024.parquet",
-#     "https://myaccount.blob.core.windows.net/data/sensors_2025.parquet",
-# ]
+# Each entry can be a local path, directory, glob pattern, or Azure Blob URL.
+#
+# Local folder — all .parquet/.parq files discovered recursively:
+#   datasets = ["datasets/parts/"]
+#
+# Azure container — all Parquet files in the container discovered automatically:
+#   datasets = ["az://myblobcontainer/"]
+#   datasets = ["az://myblobcontainer/data/sensors/"]
+#
+# Mix of sources (specific files, folders, globs, and Azure URLs):
+#   datasets = [
+#       "datasets/part1.parquet",
+#       "datasets/parts/",
+#       "datasets/extra/*.parquet",
+#       "az://myblobcontainer/data/sensors_2024.parquet",
+#       "az://myblobcontainer/data/2025/",
+#       "https://myaccount.blob.core.windows.net/data/sensors_2025.parquet",
+#   ]
 #
 # Azure authentication (used when any dataset entry is an Azure URL).
 # Priority: connection_string > sas_token > DefaultAzureCredential (auto).

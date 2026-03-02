@@ -600,7 +600,7 @@ class HighCardinalityBenchmark(_QueryBenchmarkBase):
                     f'SELECT "{tag}", count(), avg("{metric}") '
                     f'FROM "{tbl}" '
                     f'WHERE "{ts}" >= \'{s}\' AND "{ts}" < \'{e}\' '
-                    f'ORDER BY "{tag}"'
+                    f'GROUP BY "{tag}" ORDER BY "{tag}"'
                 )
                 queries.append((sql, ()))
             else:
@@ -625,7 +625,7 @@ class HighCardinalityBenchmark(_QueryBenchmarkBase):
         if adapter_name == _DB_QUESTDB:
             return [(self.name,
                 f'SELECT "{tag}", count(), avg("{metric}") FROM "{tbl}" '
-                f'WHERE "{ts}" >= \'<start>\' AND "{ts}" < \'<end>\' ORDER BY "{tag}"')]
+                f'WHERE "{ts}" >= \'<start>\' AND "{ts}" < \'<end>\' GROUP BY "{tag}" ORDER BY "{tag}"')]
         return [(self.name,
             f'SELECT "{tag}", COUNT(*) as cnt, avg("{metric}") FROM "{tbl}" '
             f'WHERE "{ts}" >= $1 AND "{ts}" < $2 GROUP BY "{tag}" ORDER BY "{tag}"')]

@@ -501,6 +501,94 @@ def _is_azure_url(source: str) -> bool:
     return s.startswith(_AZURE_URL_PREFIXES) or _AZURE_BLOB_HOST in s
 
 
+def _is_azure_folder_url(url: str) -> bool:
+    """
+    Return True if *url* points to an Azure container or folder (not a file).
+
+    Heuristics:
+    - Ends with ``/``  → folder
+    - Has no file extension after the last path segment → container/folder
+    - ``az://container`` with no further path → container root
+    """
+    s = url.rstrip()
+    if s.endswith("/"):
+        return True
+    # Extract the last path segment
+    path_part = s.split("//", 1)[-1] if "//" in s else s
+    last_segment = path_part.rsplit("/", 1)[-1]
+    # If the last segment has no dot (no extension) → likely a folder
+    if "." not in last_segment:
+        return True
+    # Check if the extension is a known data file suffix
+    ext = "." + last_segment.rsplit(".", 1)[-1].lower()
+    return ext not in SUPPORTED_SUFFIXES
+
+
+def _list_azure_container_parquets(
+    url: str,
+    connection_string: str = "",
+    sas_token: str = "",
+) -> list[str]:
+    """
+    List all Parquet files under an Azure container or folder prefix.
+
+    Returns fully-qualified ``az://`` URLs sorted alphabetically.
+
+    Uses ``fsspec``/``adlfs`` for the listing — the same library stack used
+    for streaming reads.
+    """
+    try:
+        import fsspec  # noqa: PLC0415
+    except ImportError:
+        raise DatasetError(
+            "Azure dataset support requires the 'azure' extra. "
+            "Install with: pip install tsbm[azure]"
+        ) from None
+
+    storage_options: dict[str, str] = {}
+    if connection_string:
+        storage_options["connection_string"] = connection_string
+    elif sas_token:
+        storage_options["sas_token"] = sas_token
+
+    try:
+        fs = fsspec.filesystem("az", **storage_options)
+        # Normalise the URL to a path that adlfs understands
+        prefix = url
+        for scheme in _AZURE_URL_PREFIXES:
+            if prefix.lower().startswith(scheme):
+                prefix = prefix[len(scheme):]
+                break
+        if _AZURE_BLOB_HOST in prefix.lower():
+            # https://account.blob.core.windows.net/container/path → container/path
+            idx = prefix.lower().index(_AZURE_BLOB_HOST)
+            prefix = prefix[idx + len(_AZURE_BLOB_HOST):]
+        prefix = prefix.strip("/")
+
+        all_files = fs.ls(prefix, detail=False)
+        # Also recurse into sub-folders
+        try:
+            all_files = fs.glob(f"{prefix}/**")
+        except Exception:
+            pass  # ls fallback is fine for flat containers
+
+        parquets = sorted(
+            f"az://{f}" for f in all_files
+            if f.lower().endswith((".parquet", ".parq"))
+        )
+        logger.info(
+            "Azure container %s: discovered %d Parquet file(s)",
+            url, len(parquets),
+        )
+        return parquets
+    except DatasetError:
+        raise
+    except Exception as exc:
+        raise DatasetError(
+            f"Failed to list Azure container {url!r}: {exc}"
+        ) from exc
+
+
 def resolve_dataset_sources(
     sources: list[str],
     azure_connection_string: str = "",
@@ -510,8 +598,13 @@ def resolve_dataset_sources(
     Resolve a list of dataset source strings into concrete paths or URLs.
 
     - Local paths are validated for existence.
+    - **Local directories** are expanded: all ``.parquet`` / ``.parq`` files
+      found recursively are included (sorted by name for deterministic order).
     - Glob patterns (containing ``*`` or ``?``) are expanded.
-    - Azure URLs are returned as-is (validated at read time).
+    - Azure URLs pointing to a **single file** are returned as-is.
+    - Azure URLs pointing to a **container or folder** (no file extension, or
+      ending with ``/``) are listed via ``fsspec``/``adlfs`` and all Parquet
+      files discovered under the prefix are included.
 
     Returns a list where each entry is a ``Path`` (local) or ``str`` (Azure URL).
 
@@ -523,7 +616,20 @@ def resolve_dataset_sources(
     resolved: list[Path | str] = []
     for src in sources:
         if _is_azure_url(src):
-            resolved.append(src)
+            if _is_azure_folder_url(src):
+                # Container or folder URL — list all Parquet files
+                parquets = _list_azure_container_parquets(
+                    src,
+                    connection_string=azure_connection_string,
+                    sas_token=azure_sas_token,
+                )
+                if not parquets:
+                    raise DatasetError(
+                        f"No Parquet files found in Azure container/folder: {src!r}"
+                    )
+                resolved.extend(parquets)
+            else:
+                resolved.append(src)
         elif "*" in src or "?" in src:
             # Glob pattern
             matches = sorted(globmod.glob(src, recursive=True))
@@ -537,7 +643,23 @@ def resolve_dataset_sources(
             p = Path(src)
             if not p.exists():
                 raise DatasetError(f"Dataset file not found: {p}")
-            resolved.append(p)
+            if p.is_dir():
+                # Directory — auto-discover all Parquet files recursively
+                parquet_files = sorted(
+                    f for f in p.rglob("*")
+                    if f.suffix.lower() in {".parquet", ".parq"} and f.is_file()
+                )
+                if not parquet_files:
+                    raise DatasetError(
+                        f"No Parquet files found in directory: {p}"
+                    )
+                logger.info(
+                    "Directory %s: discovered %d Parquet file(s)",
+                    p, len(parquet_files),
+                )
+                resolved.extend(parquet_files)
+            else:
+                resolved.append(p)
 
     if not resolved:
         raise DatasetError("No dataset sources resolved from the provided list")

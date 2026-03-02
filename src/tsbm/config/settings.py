@@ -99,13 +99,16 @@ class WorkloadConfig(BaseModel):
     # Can also be overridden at runtime with --timestamp-col on the CLI.
     timestamp_col: str = ""
 
-    # Multiple dataset sources: list of local paths, globs, or Azure Blob URLs.
+    # Multiple dataset sources: list of local paths, directories, globs, or Azure Blob URLs.
     # When set, these are concatenated in order during the seed phase.
     # Each entry can be:
     #   - A local file path: "datasets/part1.parquet"
+    #   - A local directory: "datasets/parts/" (all .parquet/.parq files discovered recursively)
     #   - A glob pattern: "datasets/parts/*.parquet"
-    #   - An Azure Blob URL: "az://container/path/file.parquet"
-    #     or "https://account.blob.core.windows.net/container/file.parquet"
+    #   - An Azure Blob file URL: "az://container/path/file.parquet"
+    #   - An Azure container/folder URL: "az://container/" or "az://container/subfolder"
+    #     (all Parquet files in the container/folder are discovered automatically)
+    #   - HTTPS Azure URL: "https://account.blob.core.windows.net/container/file.parquet"
     # When empty, falls back to the single `dataset` field.
     datasets: list[str] = []
 
