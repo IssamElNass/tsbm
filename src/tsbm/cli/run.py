@@ -20,6 +20,7 @@ run orchestration
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -41,7 +42,7 @@ from rich.progress import (
 from rich.table import Table
 
 from tsbm.adapters.registry import get_enabled_adapters
-from tsbm.benchmarks.registry import get_workload, list_default_workloads, list_workloads
+from tsbm.benchmarks.registry import get_workload, list_default_workloads, list_workloads, list_workloads_ordered
 from tsbm.config.settings import get_settings, load_settings_from_file
 from tsbm.datasets.loader import (
     apply_unit_conversions,
@@ -95,13 +96,12 @@ _NEEDS_SEED_BENCHMARKS: frozenset[str] = frozenset({
 })
 
 # Benchmarks that must drop + recreate the table on every run even if already seeded.
-# Ingestion manages its own warmup/measurement data; MV benchmarks need a fresh
-# table so that stale views from a previous run don't interfere.
+# Ingestion manages its own warmup/measurement data internally.
+# MV benchmarks are NOT included here: they create/drop their own views and can
+# safely reuse a pre-seeded table (late_arrival inserts negligible extra rows).
 _ALWAYS_RESET_BENCHMARKS: frozenset[str] = frozenset({
     "ingestion",
     "ingestion_out_of_order",
-    "materialized_view",
-    "late_arrival",
 })
 
 # Keep the old name as an alias so the summary table renderer can still use it.
@@ -228,7 +228,7 @@ async def async_run(
 
     known = list_workloads()
     if benchmark_name == "all":
-        workload_names = known
+        workload_names = list_workloads_ordered()
     elif benchmark_name == "default":
         workload_names = list_default_workloads()
     else:
@@ -375,16 +375,28 @@ async def async_run(
         )
 
     # ----------------------------------------------------------------
-    # 6. Run each benchmark
+    # 6. Pre-seed adapters in parallel (if query benchmarks will run)
+    # ----------------------------------------------------------------
+    seeded_adapters: set[str] = set()
+
+    # Check whether any of the upcoming benchmarks need seeded data.
+    # If so, seed adapters *once* upfront so every query/MV benchmark
+    # reuses the table — regardless of how many adapters are enabled.
+    first_needs_seed = any(
+        wl in _NEEDS_SEED_BENCHMARKS and wl not in _ALWAYS_RESET_BENCHMARKS
+        for wl in workload_names
+    )
+    if first_needs_seed:
+        n = len(adapters)
+        label = "database" if n == 1 else f"{n} databases in parallel"
+        console.print(f"\n[bold]Pre-seeding {label}…[/bold]")
+        await _parallel_seed_adapters(adapters, dataset, seeded_adapters)
+        console.print("[green]Seeding complete.[/green]")
+
+    # ----------------------------------------------------------------
+    # 7. Run each benchmark
     # ----------------------------------------------------------------
     all_run_ids: list[str] = []
-
-    # Track which adapter names already have the full dataset seeded so that
-    # consecutive query-only benchmarks (time_range → aggregation → last_point …)
-    # can reuse the table instead of dropping + re-seeding it every time.
-    # Non-query benchmarks (ingestion, mixed, …) manage their own data and will
-    # clear the set for any adapter they run against.
-    seeded_adapters: set[str] = set()
 
     for bench_idx, wl_name in enumerate(workload_names, 1):
         if len(workload_names) > 1:
@@ -420,6 +432,68 @@ async def async_run(
     # reference for every column they just saw in the results tables.
     console.print()
     _print_metric_glossary()
+
+
+async def _seed_one_adapter(
+    adapter: Any,
+    dataset: Any,
+) -> None:
+    """Connect to *adapter*, drop/create table, and ingest the full dataset."""
+    await adapter.connect()
+    try:
+        await adapter.drop_table(dataset.schema.name)
+        await adapter.create_table(dataset.schema)
+        if dataset.streaming:
+            for chunk in dataset.iter_batches():
+                await adapter.ingest_batch(chunk, dataset.schema.name)
+        else:
+            tbl = dataset.load()
+            await adapter.ingest_batch(tbl, dataset.schema.name)
+        await adapter.flush()
+    finally:
+        await adapter.disconnect()
+
+
+async def _parallel_seed_adapters(
+    adapters: list[Any],
+    dataset: Any,
+    seeded_adapters: set[str],
+) -> None:
+    """Seed all *adapters* with the full dataset in parallel."""
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        outer = progress.add_task("[bold white]seeding", total=len(adapters))
+        tasks_map: dict[str, TaskID] = {}
+        for adapter in adapters:
+            tid = progress.add_task(f"[cyan]{adapter.name}[/cyan] [dim]loading…[/dim]", total=None)
+            tasks_map[adapter.name] = tid
+
+        async def _seed_with_progress(adapter: Any) -> None:
+            try:
+                await _seed_one_adapter(adapter, dataset)
+                seeded_adapters.add(adapter.name)
+                progress.update(
+                    tasks_map[adapter.name],
+                    description=f"[cyan]{adapter.name}[/cyan] [green]seeded[/green]",
+                    completed=True,
+                )
+            except Exception as exc:
+                logger.exception("Failed to seed %s", adapter.name)
+                console.print(f"[red][{adapter.name}] Seed error: {exc}[/red]")
+                progress.update(
+                    tasks_map[adapter.name],
+                    description=f"[cyan]{adapter.name}[/cyan] [red]failed[/red]",
+                    completed=True,
+                )
+            progress.advance(outer)
+
+        await asyncio.gather(*[_seed_with_progress(a) for a in adapters])
 
 
 async def _run_adapters_for_workload(

@@ -158,17 +158,18 @@ reset_between_rounds = false
 # (not the full table), so peak memory during query runs is kept low.
 #
 # Rule of thumb:
-#   8 GB  machine → 500_000   (each 100 K chunk ≈ 7 MB @ 70 bytes/row)
-#   16 GB machine → 2_000_000
-#   32 GB machine → 5_000_000
-streaming_threshold_rows = 500_000
+#   8 GB  machine → 2_000_000   (each 2 M chunk ≈ 140 MB @ 70 bytes/row)
+#   16 GB machine → 5_000_000
+#   32 GB machine → 10_000_000
+streaming_threshold_rows = 2_000_000
 
 # Rows per streaming chunk.
 # Larger = fewer round-trips, better ingestion throughput, more RAM per chunk.
 # At ~70 bytes/row:
-#   100_000 rows ≈  7 MB per chunk
-#   500_000 rows ≈ 35 MB per chunk
-chunk_size = 500_000
+#   2_000_000 rows ≈ 140 MB per chunk
+#   5_000_000 rows ≈ 350 MB per chunk
+# For billion-row datasets, 5M keeps round-trips to ~200 while fitting in RAM.
+chunk_size = 5_000_000
 
 # ── Timestamp column override ─────────────────────────────────────────────────
 # By default the timestamp column is auto-detected by name (time, ts, timestamp,

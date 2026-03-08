@@ -1,20 +1,22 @@
 """
 CrateDB adapter.
 
-Ingestion path  — UNNEST bulk INSERT via asyncpg on the PostgreSQL wire
-                  protocol port (default 5432).  ``statement_cache_size=0``
-                  is required because CrateDB's PG wire support does not
-                  implement prepared-statement caching.
+Ingestion path  — HTTP bulk API via ``/_sql`` on the HTTP port (default 4200).
+                  Uses CrateDB's bulk_args parameter for high-throughput writes:
 
-                  INSERT INTO t (c1, c2, …)
-                  SELECT * FROM UNNEST($1::TYPE[], $2::TYPE[], …)
+                  POST /_sql
+                  {"stmt": "INSERT INTO t (c1, c2) VALUES (?, ?)",
+                   "bulk_args": [[v1, v2], [v3, v4], ...]}
+
+                  This bypasses asyncpg/PG-wire UNNEST issues entirely and is
+                  CrateDB's recommended bulk ingestion path.
 
 Consistency     — CrateDB is *eventually consistent*: newly inserted data is
                   not searchable until the next shard refresh (default ~1 s).
                   ``flush()`` issues ``REFRESH TABLE`` to force visibility
                   before query benchmarks run.
 
-Query path      — asyncpg on the same PG wire port.
+Query path      — asyncpg on the PG wire port (default 5432).
 
 Default DB      — CrateDB's default schema/database is ``"doc"``.
 
@@ -25,7 +27,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
+import aiohttp
 import asyncpg
 import pyarrow as pa
 
@@ -61,6 +65,7 @@ class CrateDBAdapter:
         self._pool: asyncpg.Pool | None = None
         self._schema: DatasetSchema | None = None
         self._current_table: str | None = None
+        self._http_session: aiohttp.ClientSession | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -79,11 +84,21 @@ class CrateDBAdapter:
                 min_size=1,
                 max_size=32,
             )
-            logger.debug("CrateDB: connected on port %d", self._config.pg_port)
+            self._http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=300),
+            )
+            logger.debug(
+                "CrateDB: connected on PG port %d, HTTP port %d",
+                self._config.pg_port,
+                self._config.http_port,
+            )
         except Exception as exc:
             raise ConnectionError(f"CrateDB connection failed: {exc}") from exc
 
     async def disconnect(self) -> None:
+        if self._http_session is not None:
+            await self._http_session.close()
+            self._http_session = None
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
@@ -91,7 +106,7 @@ class CrateDBAdapter:
 
     async def _ensure_connected(self) -> None:
         """Reconnect the pool if it was never created or was closed."""
-        if self._pool is None:
+        if self._pool is None or self._http_session is None:
             logger.warning("CrateDB: pool not initialised — reconnecting")
             await self.connect()
 
@@ -128,7 +143,7 @@ class CrateDBAdapter:
         try:
             row = await self._pool.fetchrow(  # type: ignore[union-attr]
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_name = $1",
+                "WHERE table_schema = 'doc' AND table_name = $1",
                 table_name,
             )
             return row is not None
@@ -136,7 +151,7 @@ class CrateDBAdapter:
             return False
 
     # ------------------------------------------------------------------
-    # Ingestion
+    # Ingestion — HTTP bulk API
     # ------------------------------------------------------------------
 
     async def ingest_batch(
@@ -145,14 +160,11 @@ class CrateDBAdapter:
         table_name: str,
     ) -> TimingResult:
         """
-        Bulk insert via CrateDB's UNNEST pattern.
+        Bulk insert via CrateDB's HTTP ``/_sql`` bulk API.
 
-        Type casts (``$1::TYPE[]``) are intentionally omitted from the UNNEST
-        parameters.  CrateDB's ``::`` cast operator only supports single-word
-        type names; multi-word names such as ``TIMESTAMP WITH TIME ZONE`` and
-        ``DOUBLE PRECISION`` confuse its ANTLR parser (``WITH`` is misread as
-        a CTE keyword, ``PRECISION`` as an unexpected token).  CrateDB infers
-        parameter types from the INSERT target column declarations instead.
+        Sends a single INSERT statement with ``bulk_args`` containing all
+        rows.  This is CrateDB's recommended high-throughput ingestion path
+        and avoids all asyncpg/PG-wire UNNEST type-inference issues.
         """
         if self._schema is None:
             raise IngestionError("call create_table() before ingest_batch()")
@@ -161,22 +173,43 @@ class CrateDBAdapter:
         n_rows = len(table)
         n_bytes = estimate_table_bytes(table)
 
-        # Build column lists and parameter arrays
-        cols = [c for c in schema.columns]
+        # Build the INSERT statement with positional placeholders
+        cols = list(schema.columns)
         col_names = ", ".join(f'"{c.name}"' for c in cols)
-        unnest_parts = ", ".join(f"${i + 1}" for i in range(len(cols)))
-        sql = (
-            f'INSERT INTO "{table_name}" ({col_names}) '
-            f"SELECT * FROM UNNEST({unnest_parts})"
-        )
+        placeholders = ", ".join("?" for _ in cols)
+        stmt = f'INSERT INTO "{table_name}" ({col_names}) VALUES ({placeholders})'
 
-        params = [_col_to_list(table.column(c.name), c) for c in cols]
+        # Convert columns to Python lists (vectorized timestamp conversion)
+        col_lists = [_col_to_list(table.column(c.name), c) for c in cols]
+        bulk_args = list(zip(*col_lists))
 
         await self._ensure_connected()
+        url = f"http://{self._config.host}:{self._config.http_port}/_sql"
+        payload: dict[str, Any] = {"stmt": stmt, "bulk_args": bulk_args}
+
         try:
             with timed_operation(rows=n_rows, bytes_count=n_bytes) as result:
-                await self._pool.execute(sql, *params)  # type: ignore[union-attr]
+                async with self._http_session.post(  # type: ignore[union-attr]
+                    url,
+                    json=payload,
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        raise IngestionError(
+                            f"CrateDB HTTP bulk insert failed (HTTP {resp.status}): {body}"
+                        )
+                    resp_json = await resp.json()
+                    # Check for per-row errors in the results array
+                    results = resp_json.get("results", [])
+                    errors = [r for r in results if r.get("rowcount", 0) < 0]
+                    if errors:
+                        raise IngestionError(
+                            f"CrateDB bulk insert had {len(errors)} row errors "
+                            f"out of {len(results)} batches"
+                        )
             return result
+        except IngestionError:
+            raise
         except Exception as exc:
             raise IngestionError(f"CrateDB ingest_batch failed: {exc}") from exc
 
@@ -393,7 +426,7 @@ class CrateDBAdapter:
         try:
             row = await self._pool.fetchrow(  # type: ignore[union-attr]
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_name = $1",
+                "WHERE table_schema = 'doc' AND table_name = $1",
                 view_name,
             )
             return row is not None
@@ -408,20 +441,15 @@ class CrateDBAdapter:
 
 def _col_to_list(col: pa.ChunkedArray | pa.Array, spec) -> list:  # type: ignore[type-arg]
     """
-    Convert an Arrow column to a Python list suitable for asyncpg array params.
+    Convert an Arrow column to a Python list suitable for HTTP bulk API args.
 
-    Timestamp columns are converted to UTC-aware ``datetime`` objects
-    (microsecond precision — TIMESTAMPTZ max precision in CrateDB/PostgreSQL).
+    Timestamp columns are cast to microsecond-precision UTC datetimes via
+    PyArrow's vectorized C++ cast (no per-element Python loop).  The resulting
+    datetime objects are then converted to millisecond epoch integers, which
+    is what CrateDB's HTTP API expects for TIMESTAMP columns.
     """
     if spec.role == ColumnRole.TIMESTAMP:
-        ns_vals = col.cast(pa.int64()).to_pylist()
-        return [_ns_to_datetime(ns) for ns in ns_vals]
+        # CrateDB HTTP API expects timestamps as millisecond epoch integers
+        ms_array = col.cast(pa.int64())  # nanoseconds
+        return [v // 1_000_000 if v is not None else None for v in ms_array.to_pylist()]
     return col.to_pylist()
-
-
-def _ns_to_datetime(ns: int | None) -> datetime | None:
-    """Convert nanosecond Unix epoch to a UTC-aware datetime (μs precision)."""
-    if ns is None:
-        return None
-    # timedelta arithmetic preserves microsecond precision without fp error
-    return _EPOCH + timedelta(microseconds=ns // 1_000)

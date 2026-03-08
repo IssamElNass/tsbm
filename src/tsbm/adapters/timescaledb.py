@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import asyncpg
 import pyarrow as pa
@@ -31,9 +31,6 @@ from tsbm.exceptions import ConnectionError, IngestionError, QueryError
 from tsbm.metrics.timer import TimingResult, estimate_table_bytes, timed_operation
 
 logger = logging.getLogger(__name__)
-
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-
 
 class TimescaleDBAdapter:
     """
@@ -365,24 +362,19 @@ def _build_records(
     """
     Convert an Arrow table to a list of tuples for ``copy_records_to_table``.
 
-    Timestamp columns are converted to UTC-aware ``datetime`` objects via
-    timedelta arithmetic (microsecond precision) to avoid floating-point
-    rounding and the PyArrow Windows tzdata issue.
+    Timestamp columns are cast to microsecond-precision UTC datetimes via
+    PyArrow's vectorized C++ cast — ``to_pylist()`` on a
+    ``timestamp[us, UTC]`` array returns ``datetime`` objects directly,
+    eliminating the per-element Python loop.
     """
     col_arrays: list[list] = []
     for col_spec in schema.columns:
         raw = table.column(col_spec.name)
         if col_spec.role == ColumnRole.TIMESTAMP:
-            ns_vals = raw.cast(pa.int64()).to_pylist()
-            col_arrays.append([_ns_to_datetime(ns) for ns in ns_vals])
+            col_arrays.append(
+                raw.cast(pa.timestamp("us", tz="UTC")).to_pylist()
+            )
         else:
             col_arrays.append(raw.to_pylist())
 
     return list(zip(*col_arrays))
-
-
-def _ns_to_datetime(ns: int | None) -> datetime | None:
-    """Convert nanosecond Unix epoch to a UTC-aware datetime (μs precision)."""
-    if ns is None:
-        return None
-    return _EPOCH + timedelta(microseconds=ns // 1_000)

@@ -64,6 +64,7 @@ class QuestDBAdapter:
         self._current_table: str | None = None
         self._mv_granularity: str = "1 hour"
         self._mv_ts_col: str | None = None
+        self._sender: Any = None  # Reusable questdb.ingress.Sender instance
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -88,6 +89,12 @@ class QuestDBAdapter:
             raise ConnectionError(f"QuestDB connection failed: {exc}") from exc
 
     async def disconnect(self) -> None:
+        if self._sender is not None:
+            try:
+                self._sender.__exit__(None, None, None)
+            except Exception as exc:
+                logger.debug("QuestDB: sender close error: %s", exc)
+            self._sender = None
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
@@ -153,7 +160,11 @@ class QuestDBAdapter:
         table_name: str,
     ) -> TimingResult:
         """
-        Write *table* via ILP over HTTP using the questdb Sender.
+        Write *table* via ILP over HTTP using a reusable questdb Sender.
+
+        The Sender is created lazily on first call and reused across batches
+        to avoid HTTP connection setup overhead.  ``sender.flush()`` is called
+        per batch to ensure data is committed.
 
         The Sender is synchronous; we run it in a thread pool executor
         so the asyncio event loop is not blocked (important for the mixed
@@ -170,28 +181,37 @@ class QuestDBAdapter:
         n_bytes = estimate_table_bytes(table)
 
         # Build a pandas DataFrame that the QuestDB sender understands.
-        # We convert timestamp columns explicitly to avoid the PyArrow
-        # Windows tzdata issue.
         df = _table_to_pandas_safe(table, schema)
 
         def _sync_send() -> TimingResult:
             from questdb.ingress import Sender  # noqa: PLC0415
 
+            # Reuse sender across batches — avoids HTTP connection setup per call
+            if self._sender is None:
+                self._sender = Sender.from_conf(conf_str)
+                self._sender.__enter__()
+
             with timed_operation(rows=n_rows, bytes_count=n_bytes, disable_gc=False) as result:
-                with Sender.from_conf(conf_str) as sender:
-                    sender.dataframe(
-                        df,
-                        table_name=table_name,
-                        symbols=symbols,
-                        at=ts_col,
-                    )
-                # sender.__exit__ calls flush() → HTTP POST completes here
+                self._sender.dataframe(
+                    df,
+                    table_name=table_name,
+                    symbols=symbols,
+                    at=ts_col,
+                )
+                self._sender.flush()
             return result
 
         await self._ensure_connected()
         try:
             return await asyncio.to_thread(_sync_send)
         except Exception as exc:
+            # On error, close the sender so next call creates a fresh one
+            if self._sender is not None:
+                try:
+                    self._sender.__exit__(None, None, None)
+                except Exception:
+                    pass
+                self._sender = None
             raise IngestionError(f"QuestDB ingest_batch failed: {exc}") from exc
 
     async def flush(self) -> None:
@@ -441,16 +461,18 @@ def _table_to_pandas_safe(table: pa.Table, schema: DatasetSchema) -> pd.DataFram
     Convert an Arrow table to pandas without triggering the PyArrow Windows
     timezone-database requirement.
 
-    Timestamp columns are converted via int64 nanoseconds to avoid
-    ``pc.cast(timestamp_with_tz, …)`` which needs tzdata on Windows.
+    Timestamp columns are converted via int64 nanoseconds → numpy array →
+    ``pd.to_datetime`` to avoid ``pc.cast(timestamp_with_tz, …)`` which
+    needs tzdata on Windows.  Using a numpy array instead of a Python list
+    as the intermediate avoids O(n) Python object creation overhead.
     """
     cols: dict[str, object] = {}
     for col_spec in schema.columns:
         raw = table.column(col_spec.name)
         if col_spec.role == ColumnRole.TIMESTAMP:
-            # int64 ns → pd.DatetimeIndex (utc=True does not need tzdata file)
-            ns_vals = raw.cast(pa.int64()).to_pylist()
-            cols[col_spec.name] = pd.to_datetime(ns_vals, unit="ns", utc=True)
+            # int64 ns → numpy array (zero-copy) → pd.DatetimeIndex
+            ns_array = raw.cast(pa.int64()).to_numpy()
+            cols[col_spec.name] = pd.to_datetime(ns_array, unit="ns", utc=True)
         else:
             cols[col_spec.name] = raw.to_pylist()
     return pd.DataFrame(cols)

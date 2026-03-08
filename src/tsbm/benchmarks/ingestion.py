@@ -297,8 +297,13 @@ class IngestionBenchmark:
         If workers > 1 the batch is split into equal sub-batches and run with
         asyncio.gather(); the outer timed_operation wraps the entire gather
         call so end-to-end latency is captured correctly.
+
+        Timestamp columns are pre-cast to microsecond precision once on the
+        full batch so sub-batches inherit the cast and adapters skip redundant
+        per-element conversion.
         """
         batch = table.slice(0, min(batch_size, len(table)))
+        batch = _precast_timestamps(batch, adapter)
         byte_count = estimate_table_bytes(batch)
 
         if workers <= 1:
@@ -384,6 +389,29 @@ def _aggregate_timings(timings: list[TimingResult]) -> TimingResult:
         rows_processed=sum(t.rows_processed for t in timings),
         bytes_processed=sum(t.bytes_processed for t in timings),
     )
+
+
+def _precast_timestamps(table: pa.Table, adapter: Any) -> pa.Table:
+    """
+    Pre-cast timestamp columns to microsecond precision (``us``) so that
+    downstream adapter conversion is a no-op.  This is done once on the
+    full batch before splitting into sub-batches for concurrent workers.
+    """
+    schema = getattr(adapter, "_schema", None)
+    if schema is None:
+        return table
+    ts_col = schema.timestamp_col
+    if ts_col not in table.schema.names:
+        return table
+
+    col = table.column(ts_col)
+    target = pa.timestamp("us", tz="UTC")
+    # Only cast if not already in the target type
+    if col.type != target:
+        cast_col = col.cast(target)
+        col_idx = table.schema.get_field_index(ts_col)
+        return table.set_column(col_idx, pa.field(ts_col, target), cast_col)
+    return table
 
 
 def _shuffle_timestamps(table: pa.Table, adapter: Any) -> pa.Table:
