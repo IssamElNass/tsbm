@@ -528,12 +528,10 @@ def _table_to_pandas_safe(table: pa.Table, schema: DatasetSchema) -> pd.DataFram
             continue
         if col_spec.role == ColumnRole.METRIC:
             fill_val = 0
-        elif col_spec.role == ColumnRole.TAG:
-            fill_val = ""
         elif col_spec.role == ColumnRole.OTHER:
             fill_val = ""
         else:
-            continue  # timestamp nulls are not expected
+            continue  # tags and timestamps can be null
         filled = pc.fill_null(col, fill_val)
         idx = table.schema.get_field_index(col_spec.name)
         table = table.set_column(idx, table.schema.field(idx), filled)
