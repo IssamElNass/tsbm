@@ -183,6 +183,46 @@ tsbm accepts any file that has at least one timestamp column and one numeric col
 | `.csv`             | Delimiter auto-detected; schema inferred from the first batch |
 | `.json` / `.jsonl` | Line-delimited JSON; slow for large files                     |
 
+### Azure Blob Storage
+
+tsbm can read Parquet files directly from Azure Blob Storage — no need to download them first. Install the Azure extra:
+
+```bash
+pip install tsbm[azure]
+```
+
+Point `datasets` at one or more Azure URLs:
+
+```toml
+[workload]
+datasets = [
+    "az://myblobcontainer/",
+    "az://myblobcontainer/data/sensors/",
+    "https://myaccount.blob.core.windows.net/data/sensors_2025.parquet",
+]
+```
+
+Supported URL schemes: `az://`, `abfs://`, `abfss://`, and `https://<account>.blob.core.windows.net/...`.
+Container/folder URLs are auto-expanded — all `.parquet` files under the prefix are discovered.
+
+**Authentication** (pick one — listed by priority):
+
+| Setting                            | When to use                                    |
+| ---------------------------------- | ---------------------------------------------- |
+| `azure_storage_connection_string`  | Full connection string from the Azure portal   |
+| `azure_storage_sas_token`          | Shared Access Signature token                  |
+| _(none)_                           | Falls back to `DefaultAzureCredential` (auto)  |
+
+When using a SAS token, `account_name` is required by the underlying library. It is **auto-detected** from `https://<account>.blob.core.windows.net/` URLs. For `az://` scheme URLs, set it explicitly:
+
+```toml
+[workload]
+azure_storage_sas_token    = "sv=2022-11-02&ss=b&srt=co&sp=rl..."
+azure_storage_account_name = "myaccount"   # required with az:// URLs + SAS token
+```
+
+All three settings can also be set via environment variables: `TSBM_WORKLOAD__AZURE_STORAGE_CONNECTION_STRING`, `TSBM_WORKLOAD__AZURE_STORAGE_SAS_TOKEN`, `TSBM_WORKLOAD__AZURE_STORAGE_ACCOUNT_NAME`.
+
 ### Dataset Schema / Manifest
 
 When tsbm loads a file it builds a `DatasetSchema` — an internal manifest that drives all SQL generation and metric reporting. You never write this by hand; it is inferred automatically.

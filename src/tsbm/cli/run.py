@@ -258,6 +258,7 @@ async def async_run(
     use_multi = bool(settings.workload.datasets) and not dataset_path
     azure_conn = settings.workload.azure_storage_connection_string
     azure_sas = settings.workload.azure_storage_sas_token
+    azure_acct = settings.workload.azure_storage_account_name
 
     if use_multi:
         # Multi-source mode: multiple local files, globs, and/or Azure URLs
@@ -265,6 +266,7 @@ async def async_run(
             settings.workload.datasets,
             azure_connection_string=azure_conn,
             azure_sas_token=azure_sas,
+            azure_account_name=azure_acct,
         )
         if verbose:
             console.print(f"[cyan]Loading {len(sources)} dataset source(s):[/cyan]")
@@ -286,6 +288,7 @@ async def async_run(
                 tag_cardinality_threshold=settings.workload.tag_cardinality_threshold,
                 connection_string=azure_conn,
                 sas_token=azure_sas,
+                account_name=azure_acct,
             )
 
         dataset = load_multi_dataset_streaming(
@@ -294,6 +297,7 @@ async def async_run(
             chunk_size=settings.workload.chunk_size,
             azure_connection_string=azure_conn,
             azure_sas_token=azure_sas,
+            azure_account_name=azure_acct,
         )
     else:
         # Single-file mode (original behavior)

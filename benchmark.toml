@@ -83,6 +83,7 @@ dataset = "datasets/40m.parquet"
 # Priority: connection_string > sas_token > DefaultAzureCredential (auto).
 # azure_storage_connection_string = ""
 # azure_storage_sas_token = ""
+# azure_storage_account_name = ""  # required with sas_token + az:// URLs
 
 # ── Quick run (any dataset — minimize parameter sweep for fast results) ────────
 #

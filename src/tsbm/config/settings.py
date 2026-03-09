@@ -116,6 +116,8 @@ class WorkloadConfig(BaseModel):
     # Priority: connection_string > sas_token > DefaultAzureCredential (auto).
     azure_storage_connection_string: str = ""
     azure_storage_sas_token: str = ""
+    # Required when using sas_token with az:// URLs (auto-detected from https:// URLs).
+    azure_storage_account_name: str = ""
 
 
 # ---------------------------------------------------------------------------

@@ -174,6 +174,7 @@ class BenchmarkDataset:
     source_paths: list[Any] = field(default_factory=list, repr=False)
     _azure_connection_string: str = field(default="", repr=False, compare=False)
     _azure_sas_token: str = field(default="", repr=False, compare=False)
+    _azure_account_name: str = field(default="", repr=False, compare=False)
 
     def is_lazy(self) -> bool:
         return self.table is None
@@ -211,6 +212,7 @@ class BenchmarkDataset:
             for batch in _iter_multi_source_batches(
                 self.source_paths, self.chunk_size,
                 self._azure_connection_string, self._azure_sas_token,
+                self._azure_account_name,
             ):
                 tbl = pa.Table.from_batches([batch]) if isinstance(batch, pa.RecordBatch) else batch
                 if self._unit_conversions:

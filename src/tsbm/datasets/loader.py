@@ -495,6 +495,44 @@ _AZURE_URL_PREFIXES = ("az://", "abfs://", "abfss://")
 _AZURE_BLOB_HOST = ".blob.core.windows.net/"
 
 
+def _extract_azure_account(url: str) -> str | None:
+    """Extract the storage account name from an Azure URL, if present."""
+    low = url.lower()
+    host = _AZURE_BLOB_HOST.rstrip("/")
+    if host in low:
+        # https://myaccount.blob.core.windows.net/...
+        idx = low.index(host)
+        # Walk backwards from idx to find the start of the hostname
+        prefix = url[:idx]
+        # Account is the last dot-separated segment before .blob.core...
+        account = prefix.rsplit("/", 1)[-1]
+        return account or None
+    return None
+
+
+def _azure_storage_options(
+    url: str,
+    connection_string: str = "",
+    sas_token: str = "",
+    account_name: str = "",
+) -> dict[str, str]:
+    """Build ``storage_options`` for ``fsspec``/``adlfs``.
+
+    When using a SAS token, ``adlfs`` requires an ``account_name``.
+    It is auto-extracted from ``https://<account>.blob.core.windows.net/``
+    URLs; for ``az://`` scheme URLs supply *account_name* explicitly.
+    """
+    opts: dict[str, str] = {}
+    if connection_string:
+        opts["connection_string"] = connection_string
+    elif sas_token:
+        opts["sas_token"] = sas_token
+        acct = account_name or _extract_azure_account(url)
+        if acct:
+            opts["account_name"] = acct
+    return opts
+
+
 def _is_azure_url(source: str) -> bool:
     """Return True if *source* looks like an Azure Blob Storage URL."""
     s = source.lower()
@@ -528,6 +566,7 @@ def _list_azure_container_parquets(
     url: str,
     connection_string: str = "",
     sas_token: str = "",
+    account_name: str = "",
 ) -> list[str]:
     """
     List all Parquet files under an Azure container or folder prefix.
@@ -545,11 +584,7 @@ def _list_azure_container_parquets(
             "Install with: pip install tsbm[azure]"
         ) from None
 
-    storage_options: dict[str, str] = {}
-    if connection_string:
-        storage_options["connection_string"] = connection_string
-    elif sas_token:
-        storage_options["sas_token"] = sas_token
+    storage_options = _azure_storage_options(url, connection_string, sas_token, account_name)
 
     try:
         fs = fsspec.filesystem("az", **storage_options)
@@ -593,6 +628,7 @@ def resolve_dataset_sources(
     sources: list[str],
     azure_connection_string: str = "",
     azure_sas_token: str = "",
+    azure_account_name: str = "",
 ) -> list[Path | str]:
     """
     Resolve a list of dataset source strings into concrete paths or URLs.
@@ -622,6 +658,7 @@ def resolve_dataset_sources(
                     src,
                     connection_string=azure_connection_string,
                     sas_token=azure_sas_token,
+                    account_name=azure_account_name,
                 )
                 if not parquets:
                     raise DatasetError(
@@ -672,6 +709,7 @@ def _iter_azure_batches(
     chunk_size: int,
     connection_string: str = "",
     sas_token: str = "",
+    account_name: str = "",
 ) -> Iterator[pa.RecordBatch]:
     """
     Stream Parquet batches from Azure Blob Storage.
@@ -692,12 +730,7 @@ def _iter_azure_batches(
             "Install with: pip install tsbm[azure]"
         ) from None
 
-    storage_options: dict[str, str] = {}
-    if connection_string:
-        storage_options["connection_string"] = connection_string
-    elif sas_token:
-        storage_options["sas_token"] = sas_token
-    # else: DefaultAzureCredential via adlfs (auto-detected)
+    storage_options = _azure_storage_options(url, connection_string, sas_token, account_name)
 
     try:
         with fsspec.open(url, mode="rb", **storage_options) as f:
@@ -715,6 +748,7 @@ def _iter_multi_source_batches(
     chunk_size: int = 100_000,
     azure_connection_string: str = "",
     azure_sas_token: str = "",
+    azure_account_name: str = "",
 ) -> Iterator[pa.RecordBatch]:
     """
     Yield ``RecordBatch`` objects from multiple sources sequentially.
@@ -728,7 +762,8 @@ def _iter_multi_source_batches(
         else:
             # Azure URL
             yield from _iter_azure_batches(
-                source, chunk_size, azure_connection_string, azure_sas_token
+                source, chunk_size, azure_connection_string, azure_sas_token,
+                azure_account_name,
             )
 
 
@@ -738,6 +773,7 @@ def load_multi_dataset_streaming(
     chunk_size: int = 100_000,
     azure_connection_string: str = "",
     azure_sas_token: str = "",
+    azure_account_name: str = "",
 ) -> BenchmarkDataset:
     """
     Return a :class:`BenchmarkDataset` that streams from multiple sources.
@@ -780,6 +816,7 @@ def load_multi_dataset_streaming(
         source_paths=list(sources),
         _azure_connection_string=azure_connection_string,
         _azure_sas_token=azure_sas_token,
+        _azure_account_name=azure_account_name,
     )
 
 
@@ -789,13 +826,14 @@ def infer_schema_from_azure(
     tag_cardinality_threshold: float = 0.05,
     connection_string: str = "",
     sas_token: str = "",
+    account_name: str = "",
 ) -> DatasetSchema:
     """
     Infer a ``DatasetSchema`` from the first rows of an Azure Parquet file.
     """
     batches = []
     n_read = 0
-    for batch in _iter_azure_batches(url, sample_rows, connection_string, sas_token):
+    for batch in _iter_azure_batches(url, sample_rows, connection_string, sas_token, account_name):
         batches.append(batch)
         n_read += len(batch)
         if n_read >= sample_rows:
