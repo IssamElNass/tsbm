@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -46,6 +47,7 @@ from tsbm.metrics.timer import TimingResult, estimate_table_bytes, timed_operati
 logger = logging.getLogger(__name__)
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_HTTP_BULK_CHUNK = 100_000  # max rows per HTTP POST to /_sql
 
 
 class CrateDBAdapter:
@@ -162,9 +164,9 @@ class CrateDBAdapter:
         """
         Bulk insert via CrateDB's HTTP ``/_sql`` bulk API.
 
-        Sends a single INSERT statement with ``bulk_args`` containing all
-        rows.  This is CrateDB's recommended high-throughput ingestion path
-        and avoids all asyncpg/PG-wire UNNEST type-inference issues.
+        Rows are sent in sub-batches of ``_HTTP_BULK_CHUNK`` to avoid
+        serialising millions of rows into a single JSON payload (which
+        causes memory spikes on billion-row workloads).
         """
         if self._schema is None:
             raise IngestionError("call create_table() before ingest_batch()")
@@ -185,40 +187,47 @@ class CrateDBAdapter:
 
         await self._ensure_connected()
         url = f"http://{self._config.host}:{self._config.http_port}/_sql"
-        payload: dict[str, Any] = {"stmt": stmt, "bulk_args": bulk_args}
 
         try:
             with timed_operation(rows=n_rows, bytes_count=n_bytes) as result:
-                async with self._http_session.post(  # type: ignore[union-attr]
-                    url,
-                    json=payload,
-                ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        raise IngestionError(
-                            f"CrateDB HTTP bulk insert failed (HTTP {resp.status}): {body}"
-                        )
-                    resp_json = await resp.json()
-                    # Check for per-row errors in the results array
-                    results = resp_json.get("results", [])
-                    errors = [r for r in results if r.get("rowcount", 0) < 0]
-                    if errors:
-                        raise IngestionError(
-                            f"CrateDB bulk insert had {len(errors)} row errors "
-                            f"out of {len(results)} batches"
-                        )
+                for chunk_start in range(0, len(bulk_args), _HTTP_BULK_CHUNK):
+                    chunk_args = bulk_args[chunk_start:chunk_start + _HTTP_BULK_CHUNK]
+                    payload: dict[str, Any] = {"stmt": stmt, "bulk_args": chunk_args}
+                    async with self._http_session.post(  # type: ignore[union-attr]
+                        url,
+                        json=payload,
+                    ) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            raise IngestionError(
+                                f"CrateDB HTTP bulk insert failed (HTTP {resp.status}): {body}"
+                            )
+                        resp_json = await resp.json()
+                        # Check for per-row errors in the results array
+                        results = resp_json.get("results", [])
+                        errors = [r for r in results if r.get("rowcount", 0) < 0]
+                        if errors:
+                            raise IngestionError(
+                                f"CrateDB bulk insert had {len(errors)} row errors "
+                                f"out of {len(results)} batches"
+                            )
             return result
         except IngestionError:
             raise
         except Exception as exc:
             raise IngestionError(f"CrateDB ingest_batch failed: {exc}") from exc
 
-    async def flush(self) -> None:
+    async def flush(self, expected_rows: int | None = None) -> None:
         """
         Issue ``REFRESH TABLE`` to make recently inserted rows visible.
 
         CrateDB is eventually consistent — without REFRESH, query benchmarks
         run immediately after ingestion may return stale (empty) results.
+
+        When *expected_rows* is provided, polls ``get_row_count()`` after
+        the REFRESH until the count reaches the expected value — this
+        eliminates intermittent 0-row query results caused by shard
+        refresh lag.
         """
         if self._current_table and self._pool is not None:
             try:
@@ -227,6 +236,36 @@ class CrateDBAdapter:
                 )
             except Exception as exc:
                 logger.warning("CrateDB REFRESH TABLE failed: %s", exc)
+
+            if expected_rows is not None:
+                await self.wait_for_visibility(
+                    self._current_table, expected_rows
+                )
+
+    async def wait_for_visibility(
+        self,
+        table_name: str,
+        expected_rows: int,
+        timeout_seconds: float = 60.0,
+        poll_interval: float = 0.5,
+    ) -> bool:
+        """Poll until row count reaches *expected_rows* after REFRESH TABLE."""
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                await self._pool.execute(f'REFRESH TABLE "{table_name}"')  # type: ignore[union-attr]
+                count = await self.get_row_count(table_name)
+                if count >= expected_rows:
+                    return True
+            except Exception as exc:
+                logger.debug("CrateDB visibility poll error: %s", exc)
+            await asyncio.sleep(poll_interval)
+        logger.warning(
+            "CrateDB: data visibility timeout — expected %d rows in %r "
+            "but did not reach that count within %.0fs",
+            expected_rows, table_name, timeout_seconds,
+        )
+        return False
 
     # ------------------------------------------------------------------
     # Query
@@ -443,13 +482,14 @@ def _col_to_list(col: pa.ChunkedArray | pa.Array, spec) -> list:  # type: ignore
     """
     Convert an Arrow column to a Python list suitable for HTTP bulk API args.
 
-    Timestamp columns are cast to microsecond-precision UTC datetimes via
-    PyArrow's vectorized C++ cast (no per-element Python loop).  The resulting
-    datetime objects are then converted to millisecond epoch integers, which
-    is what CrateDB's HTTP API expects for TIMESTAMP columns.
+    Timestamp columns are converted to millisecond epoch integers using
+    vectorized NumPy integer division (no per-element Python loop).
     """
     if spec.role == ColumnRole.TIMESTAMP:
-        # CrateDB HTTP API expects timestamps as millisecond epoch integers
-        ms_array = col.cast(pa.int64())  # nanoseconds
-        return [v // 1_000_000 if v is not None else None for v in ms_array.to_pylist()]
+        # CrateDB HTTP API expects timestamps as millisecond epoch integers.
+        # Vectorized: Arrow int64 (nanoseconds) → NumPy → floor-divide → list
+        import numpy as np
+        ns_array = col.cast(pa.int64()).to_numpy()
+        ms_array = (ns_array // 1_000_000).tolist()
+        return ms_array
     return col.to_pylist()

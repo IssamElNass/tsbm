@@ -312,7 +312,13 @@ class _QueryBenchmarkBase:
                             logger.error(msg)
                             result.errors.append(msg)
                             continue
-                        _, timing = item
+                        rows_returned, timing = item
+                        if not rows_returned and self._iterate_time_windows:
+                            logger.warning(
+                                "Query returned 0 rows (db=%s op=%s round=%d) "
+                                "— possible data visibility issue",
+                                adapter.name, operation, i,
+                            )
                         measurement_timings.append(timing)
                         result.operation_results.append(
                             OperationResult.from_timing(

@@ -184,7 +184,7 @@ class TimescaleDBAdapter:
                 f"TimescaleDB ingest_batch failed: {exc}"
             ) from exc
 
-    async def flush(self) -> None:
+    async def flush(self, expected_rows: int | None = None) -> None:
         """No-op — COPY commits immediately under autocommit."""
         pass
 

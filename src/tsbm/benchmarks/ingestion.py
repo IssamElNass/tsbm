@@ -80,10 +80,10 @@ class IngestionBenchmark:
         for batch_size in config.batch_sizes:
             for workers in config.workers:
                 # ---- Warmup ----
+                # Table is already pre-seeded by the orchestrator; warmup
+                # inserts additional data on top (no drop/create).
                 for i in range(config.warmup_iterations):
                     try:
-                        await adapter.drop_table(table_name)
-                        await adapter.create_table(schema)
                         timing = await self._run_batch(
                             adapter, table, table_name, batch_size, workers
                         )
@@ -103,28 +103,6 @@ class IngestionBenchmark:
                         logger.warning(
                             "Warmup error (db=%s batch=%d workers=%d iter=%d): %s",
                             adapter.name, batch_size, workers, i, exc,
-                        )
-
-                # ---- Optional pre-seed ----
-                # Insert seed rows after the last warmup (which leaves a clean
-                # table) so measurement rounds start against a pre-populated
-                # table — useful for testing append-into-existing-data latency.
-                # Has no effect when reset_between_rounds = true (the first
-                # measurement round will drop and recreate the table anyway).
-                seed_n = getattr(config, "ingestion_seed_rows", 0)
-                if seed_n > 0:
-                    seed_batch = table.slice(0, min(seed_n, len(table)))
-                    try:
-                        await adapter.ingest_batch(seed_batch, table_name)
-                        await adapter.flush()
-                        logger.info(
-                            "Pre-seeded %d rows (batch_size=%d workers=%d)",
-                            len(seed_batch), batch_size, workers,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Pre-seed error (batch_size=%d workers=%d): %s",
-                            batch_size, workers, exc,
                         )
 
                 # ---- Measurement ----
@@ -182,99 +160,81 @@ class IngestionBenchmark:
 
         Iterates over disk-based chunks rather than loading all data into memory.
         Each full pass over the dataset counts as one benchmark iteration.
-        Workers from config.workers[0] is used; multi-worker streaming is not
-        yet supported (use eager mode with a reasonably sized table instead).
+        Supports multi-worker parallelism: each chunk is split across workers
+        just like the eager path.
         """
         table_name = dataset.schema.name
-        workers = config.workers[0] if config.workers else 1
+        workers_list = config.workers if config.workers else [1]
 
-        # Warmup: one full pass per warmup iteration (always resets table)
-        for i in range(config.warmup_iterations):
-            try:
-                await adapter.drop_table(table_name)
-                await adapter.create_table(dataset.schema)
-                pass_timings: list[TimingResult] = []
-                for chunk in dataset.iter_batches():
-                    t = await self._run_batch(adapter, chunk, table_name, len(chunk), workers)
-                    pass_timings.append(t)
-                if pass_timings:
-                    agg = _aggregate_timings(pass_timings)
-                    result.operation_results.append(
-                        OperationResult.from_timing(
-                            run_id=run_id,
-                            database_name=adapter.name,
-                            operation=self.name,
-                            phase="warmup",
-                            iteration=i,
-                            timing=agg,
-                            batch_size=dataset.chunk_size,
-                            workers=workers,
+        for workers in workers_list:
+            # Warmup: one full pass per warmup iteration.
+            # Table is already pre-seeded by the orchestrator; warmup
+            # inserts additional data on top (no drop/create).
+            for i in range(config.warmup_iterations):
+                try:
+                    pass_timings: list[TimingResult] = []
+                    for chunk in dataset.iter_batches():
+                        t = await self._run_batch(adapter, chunk, table_name, len(chunk), workers)
+                        pass_timings.append(t)
+                    if pass_timings:
+                        agg = _aggregate_timings(pass_timings)
+                        result.operation_results.append(
+                            OperationResult.from_timing(
+                                run_id=run_id,
+                                database_name=adapter.name,
+                                operation=self.name,
+                                phase="warmup",
+                                iteration=i,
+                                timing=agg,
+                                batch_size=dataset.chunk_size,
+                                workers=workers,
+                            )
                         )
-                    )
-            except Exception as exc:
-                logger.warning("Streaming warmup error (iter=%d): %s", i, exc)
+                except Exception as exc:
+                    logger.warning("Streaming warmup error (workers=%d iter=%d): %s", workers, i, exc)
 
-        # ---- Optional pre-seed (streaming mode) ----
-        # Stream chunks from the dataset file until seed_n rows have been
-        # inserted, then stop.  Same semantics as the eager-mode seed.
-        seed_n = getattr(config, "ingestion_seed_rows", 0)
-        if seed_n > 0:
-            seeded = 0
-            try:
-                for chunk in dataset.iter_batches():
-                    if seeded >= seed_n:
-                        break
-                    to_take = min(seed_n - seeded, len(chunk))
-                    seed_chunk = chunk.slice(0, to_take)
-                    await adapter.ingest_batch(seed_chunk, table_name)
-                    seeded += to_take
-                await adapter.flush()
-                logger.info("Streaming pre-seeded %d rows", seeded)
-            except Exception as exc:
-                logger.warning("Streaming pre-seed error: %s", exc)
-
-        # Measurement: one full pass per measurement round
-        measurement_timings: list[TimingResult] = []
-        for i in range(config.measurement_rounds):
-            try:
-                if config.reset_between_rounds:
-                    await adapter.drop_table(table_name)
-                    await adapter.create_table(dataset.schema)
-                pass_timings = []
-                for chunk in dataset.iter_batches():
-                    t = await self._run_batch(adapter, chunk, table_name, len(chunk), workers)
-                    pass_timings.append(t)
-                if pass_timings:
-                    agg = _aggregate_timings(pass_timings)
-                    measurement_timings.append(agg)
-                    result.operation_results.append(
-                        OperationResult.from_timing(
-                            run_id=run_id,
-                            database_name=adapter.name,
-                            operation=self.name,
-                            phase="measurement",
-                            iteration=i,
-                            timing=agg,
-                            batch_size=dataset.chunk_size,
-                            workers=workers,
+            # Measurement: one full pass per measurement round
+            measurement_timings: list[TimingResult] = []
+            for i in range(config.measurement_rounds):
+                try:
+                    if config.reset_between_rounds:
+                        await adapter.drop_table(table_name)
+                        await adapter.create_table(dataset.schema)
+                    pass_timings = []
+                    for chunk in dataset.iter_batches():
+                        t = await self._run_batch(adapter, chunk, table_name, len(chunk), workers)
+                        pass_timings.append(t)
+                    if pass_timings:
+                        agg = _aggregate_timings(pass_timings)
+                        measurement_timings.append(agg)
+                        result.operation_results.append(
+                            OperationResult.from_timing(
+                                run_id=run_id,
+                                database_name=adapter.name,
+                                operation=self.name,
+                                phase="measurement",
+                                iteration=i,
+                                timing=agg,
+                                batch_size=dataset.chunk_size,
+                                workers=workers,
+                            )
                         )
-                    )
-            except Exception as exc:
-                msg = f"Streaming measurement error (iter={i}): {exc}"
-                logger.error(msg)
-                result.errors.append(msg)
+                except Exception as exc:
+                    msg = f"Streaming measurement error (workers={workers} iter={i}): {exc}"
+                    logger.error(msg)
+                    result.errors.append(msg)
 
-        if measurement_timings:
-            result.summaries.append(
-                _build_summary(
-                    run_id=run_id,
-                    database_name=adapter.name,
-                    operation=self.name,
-                    batch_size=dataset.chunk_size,
-                    workers=workers,
-                    timings=measurement_timings,
+            if measurement_timings:
+                result.summaries.append(
+                    _build_summary(
+                        run_id=run_id,
+                        database_name=adapter.name,
+                        operation=self.name,
+                        batch_size=dataset.chunk_size,
+                        workers=workers,
+                        timings=measurement_timings,
+                    )
                 )
-            )
 
     def get_queries(
         self,

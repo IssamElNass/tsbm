@@ -43,7 +43,7 @@ DEFAULT_COLUMNS: list[ColumnSpec] = [
     ColumnSpec("pressure",    ColumnRole.METRIC,    pa.float64()),
 ]
 
-_CHUNK_ROWS = 100_000  # rows per chunk for lazy / large generation
+_DEFAULT_CHUNK_ROWS = 100_000  # rows per chunk for lazy / large generation
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +60,8 @@ def generate_iot_dataset(
     name: str = "iot",
     lazy: bool = False,
     output_path: Path | None = None,
+    n_parts: int = 1,
+    chunk_rows: int | None = None,
 ) -> BenchmarkDataset:
     """
     Generate a deterministic synthetic IoT dataset.
@@ -86,6 +88,9 @@ def generate_iot_dataset(
     output_path:
         Where to write the Parquet file in lazy mode.  A temp file is created
         if ``None``.  Ignored when ``lazy=False``.
+    chunk_rows:
+        Rows per generation chunk.  Defaults to 100 000.  Increase for
+        billion-row datasets to reduce overhead (e.g. 500 000 or 1 000 000).
 
     Returns
     -------
@@ -100,10 +105,11 @@ def generate_iot_dataset(
     if interval_seconds is None:
         interval_seconds = 86400.0 / max(n_readings - 1, 1)
 
+    effective_chunk = chunk_rows or _DEFAULT_CHUNK_ROWS
     n_total = n_devices * n_readings
     schema = _build_schema(name, n_total)
 
-    if lazy or n_total > _CHUNK_ROWS:
+    if lazy or n_total > effective_chunk:
         return _generate_lazy(
             n_devices=n_devices,
             n_readings=n_readings,
@@ -112,6 +118,8 @@ def generate_iot_dataset(
             seed=seed,
             schema=schema,
             output_path=output_path,
+            n_parts=n_parts,
+            chunk_rows=effective_chunk,
         )
 
     table = _generate_table(
@@ -227,20 +235,30 @@ def _generate_chunks(
     start_ts: datetime,
     interval_seconds: float,
     seed: int,
+    device_id_offset: int = 0,
+    chunk_rows: int = _DEFAULT_CHUNK_ROWS,
 ) -> Iterator[pa.Table]:
     """
-    Yield Arrow tables in chunks of ``_CHUNK_ROWS`` rows.
+    Yield Arrow tables in chunks of *chunk_rows* rows.
 
     Generates devices in batches to stay within the chunk budget.  The PRNG
     advances deterministically regardless of chunk size so the final result
     is identical to a single-shot generation.
+
+    Parameters
+    ----------
+    device_id_offset:
+        Starting device number for device_id labels (e.g. offset=5000 produces
+        "device_005000", "device_005001", …).  Used by multi-part generation.
+    chunk_rows:
+        Maximum rows per yielded chunk (default 100 000).
     """
     rng = np.random.default_rng(seed)
     start_ns = int(start_ts.timestamp() * 1e9)
     interval_ns = int(interval_seconds * 1e9)
     offsets = np.arange(n_readings, dtype=np.int64) * interval_ns
 
-    devices_per_chunk = max(1, _CHUNK_ROWS // n_readings)
+    devices_per_chunk = max(1, chunk_rows // n_readings)
 
     for chunk_start in range(0, n_devices, devices_per_chunk):
         chunk_end = min(chunk_start + devices_per_chunk, n_devices)
@@ -252,9 +270,11 @@ def _generate_chunks(
         )
         timestamps = pa.array(ts_ns, type=TIMESTAMP_TYPE)
 
+        global_start = device_id_offset + chunk_start
+        global_end = device_id_offset + chunk_end
         device_ids = pa.array(
             np.repeat(
-                [f"device_{i:06d}" for i in range(chunk_start, chunk_end)],
+                [f"device_{i:06d}" for i in range(global_start, global_end)],
                 n_readings,
             )
         )
@@ -288,8 +308,21 @@ def _generate_lazy(
     seed: int,
     schema: DatasetSchema,
     output_path: Path | None,
+    n_parts: int = 1,
+    chunk_rows: int = _DEFAULT_CHUNK_ROWS,
 ) -> BenchmarkDataset:
-    """Write chunks to Parquet and return a lazy BenchmarkDataset."""
+    """Write chunks to Parquet and return a lazy BenchmarkDataset.
+
+    Parameters
+    ----------
+    n_parts:
+        Number of Parquet part-files to split the output into.
+        When > 1, files are written as ``<stem>_part_000.parquet`` etc.
+        inside a directory named after *output_path* (without extension).
+        This enables parallel reads during ingestion.
+    chunk_rows:
+        Rows per generation chunk (default 100 000).
+    """
     if output_path is None:
         tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
         output_path = Path(tmp.name)
@@ -297,11 +330,72 @@ def _generate_lazy(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if n_parts <= 1:
+        # Single-file output (original path)
+        total_rows = _write_single_parquet(
+            output_path, n_devices, n_readings, start_ts, interval_seconds, seed,
+            chunk_rows=chunk_rows,
+        )
+        schema.row_count = total_rows
+        return BenchmarkDataset(
+            schema=schema,
+            table=None,
+            source_path=output_path,
+            streaming=True,
+            chunk_size=chunk_rows,
+        )
+
+    # Multi-file output: create a directory and write part files
+    parts_dir = output_path.with_suffix("")
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    total_rows = 0
+    devices_per_part = max(1, n_devices // n_parts)
+
+    for part_idx in range(n_parts):
+        dev_start = part_idx * devices_per_part
+        dev_end = n_devices if part_idx == n_parts - 1 else dev_start + devices_per_part
+        part_devices = dev_end - dev_start
+        if part_devices <= 0:
+            break
+
+        part_path = parts_dir / f"{output_path.stem}_part_{part_idx:03d}.parquet"
+        part_rows = _write_single_parquet(
+            part_path, part_devices, n_readings, start_ts, interval_seconds,
+            seed=seed + part_idx,
+            device_id_offset=dev_start,
+            chunk_rows=chunk_rows,
+        )
+        total_rows += part_rows
+
+    schema.row_count = total_rows
+    return BenchmarkDataset(
+        schema=schema,
+        table=None,
+        source_path=parts_dir,
+        streaming=True,
+        chunk_size=chunk_rows,
+    )
+
+
+def _write_single_parquet(
+    output_path: Path,
+    n_devices: int,
+    n_readings: int,
+    start_ts: datetime,
+    interval_seconds: float,
+    seed: int,
+    device_id_offset: int = 0,
+    chunk_rows: int = _DEFAULT_CHUNK_ROWS,
+) -> int:
+    """Write chunks to a single Parquet file. Returns total rows written."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     writer: pq.ParquetWriter | None = None
     total_rows = 0
     try:
         for chunk in _generate_chunks(
-            n_devices, n_readings, start_ts, interval_seconds, seed
+            n_devices, n_readings, start_ts, interval_seconds, seed,
+            device_id_offset=device_id_offset,
+            chunk_rows=chunk_rows,
         ):
             if writer is None:
                 writer = pq.ParquetWriter(
@@ -314,15 +408,7 @@ def _generate_lazy(
     finally:
         if writer is not None:
             writer.close()
-
-    schema.row_count = total_rows
-    return BenchmarkDataset(
-        schema=schema,
-        table=None,
-        source_path=output_path,
-        streaming=True,
-        chunk_size=_CHUNK_ROWS,
-    )
+    return total_rows
 
 
 # ---------------------------------------------------------------------------

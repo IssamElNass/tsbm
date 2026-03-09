@@ -3,9 +3,10 @@
 # tsbm quickstart — generate data, start databases, run benchmarks, report.
 #
 # Usage:
-#   bash scripts/quickstart.sh                  # default: 11M rows, all benchmarks
+#   bash scripts/quickstart.sh                  # default: 11M rows, 6 core benchmarks
 #   bash scripts/quickstart.sh --small          # 100K rows, quick smoke-test
 #   bash scripts/quickstart.sh --large          # 100M rows, stress test
+#   bash scripts/quickstart.sh --all            # run all 10 benchmarks
 #   bash scripts/quickstart.sh --perf           # use performance-tuned Docker Compose
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
@@ -15,7 +16,7 @@ DEVICES=5000
 READINGS=2200
 DATASET="datasets/11m.parquet"
 COMPOSE_FILE="docker/docker-compose.yml"
-BENCHMARK="all"
+BENCHMARK="default"
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 for arg in "$@"; do
@@ -33,12 +34,12 @@ for arg in "$@"; do
         --perf)
             COMPOSE_FILE="docker/docker-compose.performance.yml"
             ;;
-        --default-only)
-            BENCHMARK="default"
+        --all)
+            BENCHMARK="all"
             ;;
         *)
             echo "Unknown argument: $arg"
-            echo "Usage: bash scripts/quickstart.sh [--small|--large] [--perf] [--default-only]"
+            echo "Usage: bash scripts/quickstart.sh [--small|--large] [--all] [--perf]"
             exit 1
             ;;
     esac

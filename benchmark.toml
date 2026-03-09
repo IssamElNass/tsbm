@@ -84,6 +84,14 @@ dataset = "datasets/40m.parquet"
 # azure_storage_connection_string = ""
 # azure_storage_sas_token = ""
 
+# ── Quick run (any dataset — minimize parameter sweep for fast results) ────────
+#
+#   batch_sizes        = [100_000]
+#   workers            = [1, 4]
+#   warmup_iterations  = 1
+#   measurement_rounds = 3
+#   time_windows       = ["1h", "1day"]
+
 # ── Ingestion batch sweep ──────────────────────────────────────────────────────
 # Each batch_size value is tested independently during ingestion benchmarks.
 # Larger batches amortise per-call overhead; very small batches stress the
@@ -114,6 +122,16 @@ dataset = "datasets/40m.parquet"
 #     workers     = [1, 2, 4]
 #     warmup_iterations  = 1
 #     measurement_rounds = 3
+#
+#   ~1 B rows (billion-row capacity test — requires Azure L32s_v3 or similar):
+#     tsbm generate --devices 50000 --readings 20000 --parts 10 \
+#                   --output datasets/1b.parquet
+#     batch_sizes = [500_000, 2_000_000, 5_000_000]
+#     workers     = [1, 2, 4]
+#     warmup_iterations  = 1
+#     measurement_rounds = 3
+#     streaming_threshold_rows = 2_000_000
+#     chunk_size = 5_000_000
 #
 # Memory budget: workers × batch_size × ~70 bytes live in RAM simultaneously.
 #   4 workers × 2 M rows × 70 bytes ≈ 560 MB  ← safe on 8 GB machines

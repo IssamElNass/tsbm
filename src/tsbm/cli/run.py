@@ -93,16 +93,14 @@ _NEEDS_SEED_BENCHMARKS: frozenset[str] = frozenset({
     "mixed",
     "materialized_view",
     "late_arrival",
-})
-
-# Benchmarks that must drop + recreate the table on every run even if already seeded.
-# Ingestion manages its own warmup/measurement data internally.
-# MV benchmarks are NOT included here: they create/drop their own views and can
-# safely reuse a pre-seeded table (late_arrival inserts negligible extra rows).
-_ALWAYS_RESET_BENCHMARKS: frozenset[str] = frozenset({
     "ingestion",
     "ingestion_out_of_order",
 })
+
+# Benchmarks that must drop + recreate the table on every run even if already seeded.
+# Empty: all benchmarks now reuse the pre-seeded table.  Ingestion benchmarks
+# insert additional data on top of the existing rows (more realistic).
+_ALWAYS_RESET_BENCHMARKS: frozenset[str] = frozenset()
 
 # Keep the old name as an alias so the summary table renderer can still use it.
 _QUERY_ONLY_BENCHMARKS: frozenset[str] = frozenset({
@@ -215,6 +213,7 @@ async def async_run(
     dataset_path: Path | None,
     timestamp_col: str | None = None,
     dataset_list: list[str] | None = None,
+    verbose: bool = False,
 ) -> None:
     """Full orchestration for the ``tsbm run`` command."""
 
@@ -267,9 +266,10 @@ async def async_run(
             azure_connection_string=azure_conn,
             azure_sas_token=azure_sas,
         )
-        console.print(f"[cyan]Loading {len(sources)} dataset source(s):[/cyan]")
-        for src in sources:
-            console.print(f"  [dim]{src}[/dim]")
+        if verbose:
+            console.print(f"[cyan]Loading {len(sources)} dataset source(s):[/cyan]")
+            for src in sources:
+                console.print(f"  [dim]{src}[/dim]")
 
         # Infer schema from first available source
         from tsbm.datasets.loader import _is_azure_url
@@ -298,16 +298,16 @@ async def async_run(
     else:
         # Single-file mode (original behavior)
         effective_dataset_path = Path(effective_dataset)
-        console.print(f"[cyan]Loading dataset:[/cyan] {effective_dataset_path}")
 
         n_rows_est = estimate_row_count(effective_dataset_path)
         streaming_threshold = settings.workload.streaming_threshold_rows
 
         if n_rows_est > streaming_threshold:
-            console.print(
-                f"  [dim]~{n_rows_est:,} rows > streaming threshold {streaming_threshold:,} "
-                f"— using streaming mode (chunk_size={settings.workload.chunk_size:,})[/dim]"
-            )
+            if verbose:
+                console.print(
+                    f"[cyan]Loading dataset:[/cyan] {effective_dataset_path} "
+                    f"[dim](~{n_rows_est:,} rows, streaming, chunk_size={settings.workload.chunk_size:,})[/dim]"
+                )
             schema_hint = infer_schema_from_sample(
                 effective_dataset_path,
                 sample_rows=min(50_000, n_rows_est),
@@ -324,26 +324,31 @@ async def async_run(
     # Apply unit conversions if configured
     if settings.workload.unit_conversions and dataset.table is not None:
         dataset.table = apply_unit_conversions(dataset.table, dict(settings.workload.unit_conversions))
-        console.print(f"  Unit conversions applied: {dict(settings.workload.unit_conversions)}")
+        if verbose:
+            console.print(f"  Unit conversions applied: {dict(settings.workload.unit_conversions)}")
     elif settings.workload.unit_conversions and dataset.streaming:
         # Streaming mode: attach conversions for per-batch application
         dataset._unit_conversions = dict(settings.workload.unit_conversions)
-        console.print(f"  Unit conversions (streaming mode): {dict(settings.workload.unit_conversions)}")
+        if verbose:
+            console.print(f"  Unit conversions (streaming mode): {dict(settings.workload.unit_conversions)}")
 
     # Apply timestamp column override: CLI flag takes precedence over toml setting.
     effective_ts_col = timestamp_col or settings.workload.timestamp_col or ""
     if effective_ts_col:
         from tsbm.datasets.loader import override_timestamp_col
         dataset = override_timestamp_col(dataset, effective_ts_col)
-        console.print(f"  Timestamp column overridden: [bold]{effective_ts_col}[/bold]")
 
     console.print(
-        f"  Schema: [bold]{dataset.schema.name}[/bold] "
-        f"({dataset.schema.row_count:,} rows, "
-        f"ts=[bold]{dataset.schema.timestamp_col}[/bold], "
-        f"tags={dataset.schema.tag_cols}, "
-        f"metrics={dataset.schema.metric_cols})"
+        f"[cyan]Dataset:[/cyan] [bold]{dataset.schema.name}[/bold] — "
+        f"{dataset.schema.row_count:,} rows"
+        + (f" [dim](streaming)[/dim]" if getattr(dataset, 'streaming', False) else "")
     )
+    if verbose:
+        console.print(
+            f"  ts=[bold]{dataset.schema.timestamp_col}[/bold], "
+            f"tags={dataset.schema.tag_cols}, "
+            f"metrics={dataset.schema.metric_cols}"
+        )
 
     # ----------------------------------------------------------------
     # 4. Storage
@@ -362,16 +367,16 @@ async def async_run(
         console.print("[red]No adapters available. Check --db and your config.[/red]")
         return
 
+    db_list = ", ".join(a.name for a in adapters)
     if len(workload_names) > 1:
         console.print(
-            f"\n[bold]Running {len(workload_names)} benchmarks:[/bold] "
-            f"{', '.join(workload_names)}  "
-            f"[bold]Databases:[/bold] {', '.join(a.name for a in adapters)}\n"
+            f"[cyan]Benchmarks:[/cyan] {', '.join(workload_names)}  "
+            f"[cyan]Databases:[/cyan] {db_list}"
         )
     else:
         console.print(
-            f"\n[bold]Benchmark:[/bold] {workload_names[0]}  "
-            f"[bold]Databases:[/bold] {', '.join(a.name for a in adapters)}\n"
+            f"[cyan]Benchmark:[/cyan] {workload_names[0]}  "
+            f"[cyan]Databases:[/cyan] {db_list}"
         )
 
     # ----------------------------------------------------------------
@@ -387,11 +392,7 @@ async def async_run(
         for wl in workload_names
     )
     if first_needs_seed:
-        n = len(adapters)
-        label = "database" if n == 1 else f"{n} databases in parallel"
-        console.print(f"\n[bold]Pre-seeding {label}…[/bold]")
         await _parallel_seed_adapters(adapters, dataset, seeded_adapters)
-        console.print("[green]Seeding complete.[/green]")
 
     # ----------------------------------------------------------------
     # 7. Run each benchmark
@@ -422,16 +423,16 @@ async def async_run(
         summaries = storage.load_summaries(run_ids=run_ids)
         if summaries:
             console.print()
-            _print_summary_table(summaries, wl_name)
+            _print_summary_table(summaries, wl_name, verbose=verbose)
         console.print(f"[dim]Run IDs ({wl_name}): {', '.join(run_ids)}[/dim]")
 
-    if len(workload_names) > 1:
+    if verbose and len(workload_names) > 1:
         console.print(f"\n[dim]All run IDs: {', '.join(all_run_ids)}[/dim]")
 
-    # Print the metric glossary once at the very end so the user has a
-    # reference for every column they just saw in the results tables.
-    console.print()
-    _print_metric_glossary()
+    # Print the metric glossary only in verbose mode — it's 100+ lines.
+    if verbose:
+        console.print()
+        _print_metric_glossary()
 
 
 async def _seed_one_adapter(
@@ -443,13 +444,16 @@ async def _seed_one_adapter(
     try:
         await adapter.drop_table(dataset.schema.name)
         await adapter.create_table(dataset.schema)
+        rows_ingested = 0
         if dataset.streaming:
             for chunk in dataset.iter_batches():
                 await adapter.ingest_batch(chunk, dataset.schema.name)
+                rows_ingested += len(chunk)
         else:
             tbl = dataset.load()
             await adapter.ingest_batch(tbl, dataset.schema.name)
-        await adapter.flush()
+            rows_ingested = len(tbl)
+        await adapter.flush(expected_rows=rows_ingested)
     finally:
         await adapter.disconnect()
 
@@ -577,13 +581,16 @@ async def _run_adapters_for_workload(
                         # In streaming mode, chunks are fed one at a time to
                         # avoid loading the whole dataset into RAM at once.
                         progress.update(db_task, description=f"{task_desc} [dim]loading data…[/dim]")
+                        rows_ingested = 0
                         if dataset.streaming:
                             for _chunk in dataset.iter_batches():
                                 await adapter.ingest_batch(_chunk, dataset.schema.name)
+                                rows_ingested += len(_chunk)
                         else:
                             _tbl = dataset.load()
                             await adapter.ingest_batch(_tbl, dataset.schema.name)
-                        await adapter.flush()
+                            rows_ingested = len(_tbl)
+                        await adapter.flush(expected_rows=rows_ingested)
                         seeded_adapters.add(adapter.name)
 
                 # Start resource monitor
@@ -650,45 +657,64 @@ async def async_generate(
     n_readings: int,
     seed: int,
     output_path: Path,
+    n_parts: int = 1,
+    chunk_rows: int | None = None,
 ) -> None:
     """Generate synthetic IoT data and write to *output_path*."""
-    from tsbm.datasets.generator import generate_iot_dataset
+    from tsbm.datasets.generator import generate_iot_dataset, _DEFAULT_CHUNK_ROWS
     import pyarrow.parquet as pq
-    import pyarrow.csv as pa_csv
 
+    effective_chunk = chunk_rows or _DEFAULT_CHUNK_ROWS
+    n_total = n_devices * n_readings
+    parts_label = f", {n_parts} part-files" if n_parts > 1 else ""
     console.print(
-        f"Generating [bold]{n_devices * n_readings:,}[/bold] rows "
-        f"({n_devices} devices × {n_readings} readings/device, seed={seed})…"
+        f"Generating [bold]{n_total:,}[/bold] rows "
+        f"({n_devices} devices × {n_readings} readings/device, seed={seed}{parts_label})…"
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = output_path.suffix.lower()
+
+    if suffix == ".csv":
+        from tsbm.datasets.generator import generate_to_csv
+        generate_to_csv(
+            path=output_path,
+            n_devices=n_devices,
+            n_readings_per_device=n_readings,
+            seed=seed,
+        )
+        console.print(f"[green]Written:[/green] {output_path}  ({output_path.stat().st_size // 1024:,} KB)")
+        return
+
+    # For large datasets (> chunk threshold), use lazy/streaming generation to
+    # avoid loading all rows into memory.  This is critical for billion-row
+    # datasets where eager mode would exhaust RAM.
+    use_lazy = n_total > effective_chunk
     bds = generate_iot_dataset(
         n_devices=n_devices,
         n_readings_per_device=n_readings,
         seed=seed,
         name=output_path.stem,
-        lazy=False,
+        lazy=use_lazy,
+        output_path=output_path if use_lazy else None,
+        n_parts=n_parts,
+        chunk_rows=chunk_rows,
     )
 
-    tbl = bds.load()
-    suffix = output_path.suffix.lower()
+    if not use_lazy:
+        # Small dataset: write the in-memory table to disk
+        tbl = bds.load()
+        if suffix in (".parquet", ".parq"):
+            pq.write_table(tbl, output_path, compression="snappy")
+        else:
+            pq.write_table(tbl, output_path.with_suffix(".parquet"), compression="snappy")
+            output_path = output_path.with_suffix(".parquet")
 
-    if suffix in (".parquet", ".parq"):
-        pq.write_table(tbl, output_path, compression="snappy")
-    elif suffix == ".csv":
-        from tsbm.datasets.generator import generate_to_csv
-        generate_to_csv(
-            output_path=output_path,
-            n_devices=n_devices,
-            n_readings_per_device=n_readings,
-            seed=seed,
-        )
+    if n_parts > 1:
+        parts_dir = output_path.with_suffix("")
+        console.print(f"[green]Written:[/green] {parts_dir}/  ({n_parts} part-files, {n_total:,} rows)")
     else:
-        # Default to Parquet
-        pq.write_table(tbl, output_path.with_suffix(".parquet"), compression="snappy")
-        output_path = output_path.with_suffix(".parquet")
-
-    console.print(f"[green]Written:[/green] {output_path}  ({output_path.stat().st_size // 1024:,} KB)")
+        console.print(f"[green]Written:[/green] {output_path}  ({output_path.stat().st_size // 1024:,} KB)")
 
 
 # ---------------------------------------------------------------------------
@@ -821,17 +847,18 @@ def _assign_verdicts(summaries: list[dict[str, Any]], benchmark_name: str) -> di
     return verdicts
 
 
-def _print_summary_table(summaries: list[dict[str, Any]], benchmark_name: str) -> None:
-    # Description panel
-    desc = _BENCHMARK_DESCRIPTIONS.get(benchmark_name)
-    if desc:
-        console.print(
-            Panel(
-                f"[bold]{benchmark_name}[/bold]\n[dim]{desc}[/dim]",
-                border_style="blue",
-                padding=(0, 1),
+def _print_summary_table(summaries: list[dict[str, Any]], benchmark_name: str, *, verbose: bool = False) -> None:
+    # Description panel — only in verbose mode (benchmark name is in the table title)
+    if verbose:
+        desc = _BENCHMARK_DESCRIPTIONS.get(benchmark_name)
+        if desc:
+            console.print(
+                Panel(
+                    f"[bold]{benchmark_name}[/bold]\n[dim]{desc}[/dim]",
+                    border_style="blue",
+                    padding=(0, 1),
+                )
             )
-        )
 
     verdicts = _assign_verdicts(summaries, benchmark_name)
 
@@ -878,39 +905,41 @@ def _print_summary_table(summaries: list[dict[str, Any]], benchmark_name: str) -
 
     console.print(speed_table)
 
-    # --- Table 2: Consistency ---
-    consistency_table = Table(
-        title=f"Consistency — [bold]{benchmark_name}[/bold]",
-        show_header=True,
-        header_style="bold blue",
-    )
-    consistency_table.add_column("Database",   style="cyan",  no_wrap=True)
-    consistency_table.add_column("Operation",  style="white")
-    consistency_table.add_column("Stddev ms",  justify="right", style="yellow")
-    consistency_table.add_column("CV%",        justify="right", style="yellow")
-    consistency_table.add_column("IQR ms",     justify="right", style="white")
-    consistency_table.add_column("Min ms",     justify="right", style="green")
-    consistency_table.add_column("Max ms",     justify="right", style="red")
-    consistency_table.add_column("Outliers",   justify="right", style="dim")
-
-    for row in summaries:
-        if row.get("latency_p50_ms") is None:
-            continue
-        stddev = row.get("latency_stddev_ms", 0) or 0
-        mean = row.get("latency_mean_ms", 0) or 0
-        cv = f"{stddev / mean * 100:.1f}%" if mean > 0 else "—"
-        consistency_table.add_row(
-            str(row.get("database_name", "")),
-            str(row.get("operation", "")),
-            f"{stddev:.2f}",
-            cv,
-            f"{row.get('latency_iqr_ms', 0):.2f}",
-            f"{row.get('latency_min_ms', 0):.2f}",
-            f"{row.get('latency_max_ms', 0):.2f}",
-            str(row.get("latency_outlier_count", 0)),
+    if verbose:
+        # --- Table 2: Consistency ---
+        consistency_table = Table(
+            title=f"Consistency — [bold]{benchmark_name}[/bold]",
+            show_header=True,
+            header_style="bold blue",
         )
+        consistency_table.add_column("Database",   style="cyan",  no_wrap=True)
+        consistency_table.add_column("Operation",  style="white")
+        consistency_table.add_column("Stddev ms",  justify="right", style="yellow")
+        consistency_table.add_column("CV%",        justify="right", style="yellow")
+        consistency_table.add_column("IQR ms",     justify="right", style="white")
+        consistency_table.add_column("Min ms",     justify="right", style="green")
+        consistency_table.add_column("Max ms",     justify="right", style="red")
+        consistency_table.add_column("Outliers",   justify="right", style="dim")
 
-    console.print(consistency_table)
+        for row in summaries:
+            if row.get("latency_p50_ms") is None:
+                continue
+            stddev = row.get("latency_stddev_ms", 0) or 0
+            mean = row.get("latency_mean_ms", 0) or 0
+            cv = f"{stddev / mean * 100:.1f}%" if mean > 0 else "—"
+            consistency_table.add_row(
+                str(row.get("database_name", "")),
+                str(row.get("operation", "")),
+                f"{stddev:.2f}",
+                cv,
+                f"{row.get('latency_iqr_ms', 0):.2f}",
+                f"{row.get('latency_min_ms', 0):.2f}",
+                f"{row.get('latency_max_ms', 0):.2f}",
+                str(row.get("latency_outlier_count", 0)),
+            )
+
+        console.print(consistency_table)
+
     _print_interpretation(summaries, benchmark_name)
 
 

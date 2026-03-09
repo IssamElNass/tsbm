@@ -180,8 +180,7 @@ class QuestDBAdapter:
         n_rows = len(table)
         n_bytes = estimate_table_bytes(table)
 
-        # Build a pandas DataFrame that the QuestDB sender understands.
-        df = _table_to_pandas_safe(table, schema)
+        _PANDAS_CHUNK = 100_000  # rows per pandas conversion to cap peak memory
 
         def _sync_send() -> TimingResult:
             from questdb.ingress import Sender  # noqa: PLC0415
@@ -192,12 +191,17 @@ class QuestDBAdapter:
                 self._sender.__enter__()
 
             with timed_operation(rows=n_rows, bytes_count=n_bytes, disable_gc=False) as result:
-                self._sender.dataframe(
-                    df,
-                    table_name=table_name,
-                    symbols=symbols,
-                    at=ts_col,
-                )
+                # Process in sub-chunks to avoid doubling memory with a
+                # full pandas copy on billion-row workloads.
+                for offset in range(0, n_rows, _PANDAS_CHUNK):
+                    sub_table = table.slice(offset, min(_PANDAS_CHUNK, n_rows - offset))
+                    sub_df = _table_to_pandas_safe(sub_table, schema)
+                    self._sender.dataframe(
+                        sub_df,
+                        table_name=table_name,
+                        symbols=symbols,
+                        at=ts_col,
+                    )
                 self._sender.flush()
             return result
 
@@ -214,9 +218,42 @@ class QuestDBAdapter:
                 self._sender = None
             raise IngestionError(f"QuestDB ingest_batch failed: {exc}") from exc
 
-    async def flush(self) -> None:
-        """No-op — ILP HTTP acknowledges after commit."""
-        pass
+    async def flush(self, expected_rows: int | None = None) -> None:
+        """
+        Wait until ILP-ingested data is visible via the PG wire protocol.
+
+        ILP HTTP acknowledges after commit, but data may not be immediately
+        queryable via PGWire.  When *expected_rows* is provided, polls
+        ``get_row_count()`` until visibility is confirmed.
+        """
+        if expected_rows is not None and self._current_table:
+            await self.wait_for_visibility(
+                self._current_table, expected_rows
+            )
+
+    async def wait_for_visibility(
+        self,
+        table_name: str,
+        expected_rows: int,
+        timeout_seconds: float = 60.0,
+        poll_interval: float = 0.5,
+    ) -> bool:
+        """Poll until row count reaches *expected_rows*."""
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                count = await self.get_row_count(table_name)
+                if count >= expected_rows:
+                    return True
+            except Exception as exc:
+                logger.debug("QuestDB visibility poll error: %s", exc)
+            await asyncio.sleep(poll_interval)
+        logger.warning(
+            "QuestDB: data visibility timeout — expected %d rows in %r "
+            "but did not reach that count within %.0fs",
+            expected_rows, table_name, timeout_seconds,
+        )
+        return False
 
     # ------------------------------------------------------------------
     # Query

@@ -95,6 +95,7 @@ def cmd_run(
         dataset_path=dataset_path,
         timestamp_col=timestamp_col,
         dataset_list=dataset_list,
+        verbose=verbose,
     ))
 
 
@@ -112,6 +113,14 @@ def cmd_generate(
         Path,
         typer.Option("--output", "-o", help="Output file path (.parquet or .csv)."),
     ] = Path("datasets/generated.parquet"),
+    parts: Annotated[
+        int,
+        typer.Option("--parts", "-p", help="Split output into N Parquet part-files for parallel reads. Default: 1 (single file)."),
+    ] = 1,
+    chunk_rows: Annotated[
+        int,
+        typer.Option("--chunk-rows", help="Rows per generation chunk. Increase for billion-row datasets (e.g. 500000). Default: 100000."),
+    ] = 0,
 ) -> None:
     """Generate a synthetic IoT dataset and write it to a file."""
     asyncio.run(async_generate(
@@ -119,6 +128,8 @@ def cmd_generate(
         n_readings=readings,
         seed=seed,
         output_path=output,
+        n_parts=parts,
+        chunk_rows=chunk_rows or None,
     ))
 
 
