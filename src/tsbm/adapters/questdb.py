@@ -521,22 +521,25 @@ def _table_to_pandas_safe(table: pa.Table, schema: DatasetSchema) -> pd.DataFram
     """
     import pyarrow.compute as pc  # noqa: PLC0415
 
-    # Drop rows that contain any null in metric columns — QuestDB ILP
-    # does not accept NaN / None values.
-    null_cols = [
-        col_spec.name
-        for col_spec in schema.columns
-        if col_spec.role == ColumnRole.METRIC and table.column(col_spec.name).null_count > 0
-    ]
-    if null_cols:
-        mask = None
-        for name in null_cols:
-            col_valid = pc.is_valid(table.column(name))
-            mask = col_valid if mask is None else pc.and_(mask, col_valid)
-        table = table.filter(mask)
-        logger.debug(
-            "QuestDB: dropped rows with nulls in columns %s (%d rows remaining)",
-            null_cols, len(table),
+    # Fill nulls — QuestDB ILP Sender.dataframe() rejects NaN / None values.
+    for col_spec in schema.columns:
+        col = table.column(col_spec.name)
+        if col.null_count == 0:
+            continue
+        if col_spec.role == ColumnRole.METRIC:
+            fill_val = 0
+        elif col_spec.role == ColumnRole.TAG:
+            fill_val = ""
+        elif col_spec.role == ColumnRole.OTHER:
+            fill_val = ""
+        else:
+            continue  # timestamp nulls are not expected
+        filled = pc.fill_null(col, fill_val)
+        idx = table.schema.get_field_index(col_spec.name)
+        table = table.set_column(idx, table.schema.field(idx), filled)
+        logger.warning(
+            "QuestDB: filled %d nulls with %r in column %r",
+            col.null_count, fill_val, col_spec.name,
         )
 
     cols: dict[str, object] = {}
