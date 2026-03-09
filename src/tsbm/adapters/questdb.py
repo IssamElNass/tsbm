@@ -206,17 +206,29 @@ class QuestDBAdapter:
             return result
 
         await self._ensure_connected()
-        try:
-            return await asyncio.to_thread(_sync_send)
-        except Exception as exc:
-            # On error, close the sender so next call creates a fresh one
-            if self._sender is not None:
-                try:
-                    self._sender.__exit__(None, None, None)
-                except Exception:
-                    pass
-                self._sender = None
-            raise IngestionError(f"QuestDB ingest_batch failed: {exc}") from exc
+        max_retries = 3
+        last_exc: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                return await asyncio.to_thread(_sync_send)
+            except Exception as exc:
+                # Close stale sender so next attempt creates a fresh one
+                if self._sender is not None:
+                    try:
+                        self._sender.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                    self._sender = None
+                last_exc = exc
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        "QuestDB ingest_batch attempt %d/%d failed: %s — retrying",
+                        attempt + 1, max_retries, exc,
+                    )
+                    await asyncio.sleep(1.0 * (attempt + 1))
+        raise IngestionError(
+            f"QuestDB ingest_batch failed after {max_retries} attempts: {last_exc}"
+        ) from last_exc
 
     async def flush(self, expected_rows: int | None = None) -> None:
         """
