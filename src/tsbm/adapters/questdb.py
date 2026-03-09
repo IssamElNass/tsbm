@@ -514,7 +514,31 @@ def _table_to_pandas_safe(table: pa.Table, schema: DatasetSchema) -> pd.DataFram
     ``pd.to_datetime`` to avoid ``pc.cast(timestamp_with_tz, …)`` which
     needs tzdata on Windows.  Using a numpy array instead of a Python list
     as the intermediate avoids O(n) Python object creation overhead.
+
+    Null values in Arrow columns are dropped before conversion because the
+    QuestDB ILP ``Sender.dataframe()`` rejects NaN / None with
+    ``IngressError``.
     """
+    import pyarrow.compute as pc  # noqa: PLC0415
+
+    # Drop rows that contain any null in metric columns — QuestDB ILP
+    # does not accept NaN / None values.
+    null_cols = [
+        col_spec.name
+        for col_spec in schema.columns
+        if col_spec.role == ColumnRole.METRIC and table.column(col_spec.name).null_count > 0
+    ]
+    if null_cols:
+        mask = None
+        for name in null_cols:
+            col_valid = pc.is_valid(table.column(name))
+            mask = col_valid if mask is None else pc.and_(mask, col_valid)
+        table = table.filter(mask)
+        logger.debug(
+            "QuestDB: dropped rows with nulls in columns %s (%d rows remaining)",
+            null_cols, len(table),
+        )
+
     cols: dict[str, object] = {}
     for col_spec in schema.columns:
         raw = table.column(col_spec.name)
