@@ -521,23 +521,26 @@ def _table_to_pandas_safe(table: pa.Table, schema: DatasetSchema) -> pd.DataFram
     """
     import pyarrow.compute as pc  # noqa: PLC0415
 
-    # Fill nulls — QuestDB ILP Sender.dataframe() rejects NaN / None values.
-    for col_spec in schema.columns:
-        col = table.column(col_spec.name)
-        if col.null_count == 0:
-            continue
-        if col_spec.role == ColumnRole.METRIC:
-            fill_val = 0
-        elif col_spec.role == ColumnRole.OTHER:
-            fill_val = ""
-        else:
-            continue  # tags and timestamps can be null
-        filled = pc.fill_null(col, fill_val)
-        idx = table.schema.get_field_index(col_spec.name)
-        table = table.set_column(idx, table.schema.field(idx), filled)
+    # Drop rows with nulls — QuestDB ILP Sender.dataframe() rejects NaN / None.
+    null_cols = [
+        (col_spec.name, table.column(col_spec.name).null_count)
+        for col_spec in schema.columns
+        if table.column(col_spec.name).null_count > 0
+    ]
+    if null_cols:
+        before = len(table)
+        mask = None
+        for name, _ in null_cols:
+            col_valid = pc.is_valid(table.column(name))
+            mask = col_valid if mask is None else pc.and_(mask, col_valid)
+        table = table.filter(mask)
+        dropped = before - len(table)
+        for name, count in null_cols:
+            logger.warning(
+                "QuestDB: column %r has %d nulls", name, count,
+            )
         logger.warning(
-            "QuestDB: filled %d nulls with %r in column %r",
-            col.null_count, fill_val, col_spec.name,
+            "QuestDB: dropped %d rows with nulls (%d remaining)", dropped, len(table),
         )
 
     cols: dict[str, object] = {}
