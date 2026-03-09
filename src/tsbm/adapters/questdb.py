@@ -176,7 +176,7 @@ class QuestDBAdapter:
         schema = self._schema
         conf_str = (
             f"http::addr={self._config.host}:{self._config.ilp_port};"
-            f"auto_flush_rows=1000000;auto_flush_interval=off;"
+            f"auto_flush_rows=100000;auto_flush_interval=off;"
         )
         symbols = [c.name for c in schema.columns if c.role == ColumnRole.TAG]
         ts_col = schema.timestamp_col

@@ -28,6 +28,7 @@ services:
       - "5001:9000" # ILP HTTP + Web Console
       - "8812:8812" # PGWire
     environment:
+      JVM_PREPEND: "-Xmx2g -Xms1g"
       QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "1000000"
       QDB_SHARED_WORKER_COUNT: "2"
       QDB_HTTP_ENABLED: "true"

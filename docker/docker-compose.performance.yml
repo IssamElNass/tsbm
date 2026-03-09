@@ -1,16 +1,12 @@
 ###############################################################################
 # TSBench — Performance-Tuned Docker Compose
 #
-# Optimised for a DEDICATED benchmark machine with ≥ 16 cores and ≥ 64 GB RAM
-# where all CPU and RAM are available to the databases.
-# Do NOT use on a shared host — memory limits are intentionally absent.
+# Optimised for a DEDICATED benchmark machine.
+# Do NOT use on a shared host — memory limits are tuned for exclusive use.
 #
-# Default target: 16 cores / 64 GB RAM
-# Each setting has a comment showing what to change for a 32-core / 128 GB machine:
-#   "# → 32c/128GB"
-#
-# For smaller machines (8 cores / 32 GB) use docker-compose.yml and apply
-# these overrides manually — see the scaling table at the bottom of this file.
+# Default target: 16 cores / 32 GB RAM
+# Each setting has a comment showing what to change for larger machines:
+#   "# → 16c/64GB"  and  "# → 32c/128GB"
 #
 # Usage:
 #   docker compose -f docker/docker-compose.performance.yml up -d
@@ -65,21 +61,33 @@ services:
     environment:
       QDB_HTTP_ENABLED: "true"
 
+      # Java heap — explicit limit prevents OOM on large ingestion workloads.
+      # QuestDB Docker uses JVM_PREPEND (not JAVA_OPTS) to pass JVM flags.
+      # Rule: ~25% of total RAM when sharing with other databases.
+      # QuestDB also uses significant off-heap memory (mmap, direct buffers)
+      # so the container limit must be higher than -Xmx.
+      JVM_PREPEND: "-Xmx8g -Xms4g"                        # → 16c/64GB: -Xmx16g -Xms8g  → 32c/128GB: -Xmx32g -Xms16g
+
       # Parallelism — match physical core count
       QDB_SHARED_WORKER_COUNT: "16"                        # → 32c: 32
       QDB_CAIRO_SQL_PARALLEL_FILTER_WORKER_COUNT: "16"     # → 32c: 32
       QDB_CAIRO_SQL_PARALLEL_GROUPBY_ENABLED: "true"
 
-      # Write path — 4 M rows buffered before commit (~280 MB at 70 B/row)
-      QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "4000000"            # → 32c/128GB: 8000000
+      # Write path — 1 M rows buffered before commit (~70 MB at 70 B/row)
+      # Lower than 64GB profile to stay within heap budget on 32GB machines.
+      QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "1000000"            # → 16c/64GB: 4000000  → 32c/128GB: 8000000
 
-      # Network — 32 MB receive buffer handles large ILP batches in one read
-      QDB_LINE_HTTP_RECV_BUFFER_SIZE: "33554432"           # 32 MB
+      # Network — 16 MB receive buffer handles large ILP batches in one read
+      QDB_LINE_HTTP_RECV_BUFFER_SIZE: "16777216"           # 16 MB  → 16c/64GB: 32 MB (33554432)  → 32c/128GB: 64 MB
 
       # HTTP handler threads for Web Console and REST queries
       QDB_HTTP_WORKER_COUNT: "8"                           # → 32c: 16
     volumes:
       - questdb_perf_data:/var/lib/questdb
+    deploy:
+      resources:
+        limits:
+          memory: 10g                                      # → 16c/64GB: 20g  → 32c/128GB: 40g
     ulimits:
       nofile:
         soft: 131072
@@ -129,8 +137,9 @@ services:
       - "4200:4200"   # HTTP / Admin UI
       - "5432:5432"   # PGWire
     environment:
-      # Heap = 50% of RAM; leave the other 50% for OS page cache / mmap
-      CRATE_HEAP_SIZE: "32g"                               # → 32c/128GB: 64g
+      # Heap — must fit within container memory limit.
+      # On 32GB shared machines, 8g heap + 2g for OS cache = 10g container.
+      CRATE_HEAP_SIZE: "8g"                                # → 16c/64GB: 16g  → 32c/128GB: 32g
     command: >
       crate
       -Cnetwork.host=0.0.0.0
@@ -141,7 +150,7 @@ services:
       -Cindex.number_of_replicas=0
       -Cindex.number_of_shards=16                          # → 32c: 32
 
-      -Cindices.memory.index_buffer_size=8192mb            # → 32c/128GB: 16384mb
+      -Cindices.memory.index_buffer_size=2048mb            # → 16c/64GB: 4096mb  → 32c/128GB: 8192mb
 
       -Ccluster.routing.allocation.disk.threshold_enabled=false
 
@@ -149,6 +158,10 @@ services:
       -Cthreadpool.write.size=16                           # → 32c: 32
     volumes:
       - cratedb_perf_data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 10g                                      # → 16c/64GB: 20g  → 32c/128GB: 40g
     ulimits:
       nofile:
         soft: 131072
@@ -239,10 +252,10 @@ services:
     command: >
       postgres
 
-      -c shared_buffers=16GB
-      -c effective_cache_size=48GB
-      -c work_mem=512MB
-      -c maintenance_work_mem=4GB
+      -c shared_buffers=6GB                                # → 16c/64GB: 16GB  → 32c/128GB: 32GB
+      -c effective_cache_size=8GB                           # → 16c/64GB: 48GB  → 32c/128GB: 96GB
+      -c work_mem=256MB                                    # → 16c/64GB: 512MB  → 32c/128GB: 1GB
+      -c maintenance_work_mem=2GB                          # → 16c/64GB: 4GB  → 32c/128GB: 8GB
 
       -c max_parallel_workers_per_gather=8
       -c max_parallel_workers=16
@@ -257,17 +270,21 @@ services:
 
       -c checkpoint_completion_target=0.9
       -c wal_buffers=64MB
-      -c max_wal_size=8GB
-      -c min_wal_size=2GB
+      -c max_wal_size=4GB                                  # → 16c/64GB: 8GB  → 32c/128GB: 16GB
+      -c min_wal_size=1GB                                  # → 16c/64GB: 2GB  → 32c/128GB: 4GB
       -c synchronous_commit=off
       -c bgwriter_lru_maxpages=200
       -c bgwriter_delay=50ms
 
       -c timescaledb.max_background_workers=32
     # shm_size must exceed shared_buffers — Docker default of 64 MB will crash.
-    shm_size: '18gb'
+    shm_size: '8gb'                                        # → 16c/64GB: 18gb  → 32c/128GB: 36gb
     volumes:
       - timescaledb_perf_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 10g                                      # → 16c/64GB: 20g  → 32c/128GB: 40g
     ulimits:
       nofile:
         soft: 131072
@@ -290,26 +307,30 @@ volumes:
 ###############################################################################
 # Scaling reference
 #
-#  Setting                              8c/32GB   16c/64GB   32c/128GB
+#  Setting                             16c/32GB   16c/64GB   32c/128GB
 #  ─────────────────────────────────────────────────────────────────────
-#  QuestDB shared worker count              8         16          32
-#  QuestDB parallel filter workers          8         16          32
-#  QuestDB HTTP workers                     4          8          16
-#  QuestDB max uncommitted rows         2 000K     4 000K      8 000K
+#  QuestDB Java heap (-Xmx)                8g        16g         32g
+#  QuestDB container memory limit         10g        20g         40g
+#  QuestDB shared worker count             16         16          32
+#  QuestDB parallel filter workers         16         16          32
+#  QuestDB HTTP workers                     8          8          16
+#  QuestDB max uncommitted rows         1 000K     4 000K      8 000K
 #  QuestDB ILP recv buffer               16 MB      32 MB       64 MB
 #  ─────────────────────────────────────────────────────────────────────
-#  CrateDB heap                           16g        32g         64g
-#  CrateDB default shards                  8         16          32
-#  CrateDB index buffer                 4096mb    8192mb     16384mb
-#  CrateDB search/write threadpool          8         16          32
+#  CrateDB heap                            8g        16g         32g
+#  CrateDB container memory limit         10g        20g         40g
+#  CrateDB default shards                 16         16          32
+#  CrateDB index buffer                 2048mb    4096mb      8192mb
+#  CrateDB search/write threadpool         16         16          32
 #  ─────────────────────────────────────────────────────────────────────
-#  TimescaleDB shared_buffers             8GB       16GB         32GB
-#  TimescaleDB effective_cache_size      24GB       48GB         96GB
+#  TimescaleDB shared_buffers             6GB       16GB         32GB
+#  TimescaleDB effective_cache_size       8GB       48GB         96GB
 #  TimescaleDB work_mem                 256MB      512MB          1GB
 #  TimescaleDB maintenance_work_mem       2GB        4GB          8GB
-#  TimescaleDB parallel workers/query      4          8           12
-#  TimescaleDB max_parallel_workers        8         16           32
-#  TimescaleDB max_worker_processes       16         32           64
-#  TimescaleDB max_background_workers     16         32           64
-#  TimescaleDB shm_size                  10gb       18gb         36gb
+#  TimescaleDB parallel workers/query       8          8           12
+#  TimescaleDB max_parallel_workers       16         16           32
+#  TimescaleDB max_worker_processes       32         32           64
+#  TimescaleDB max_background_workers     32         32           64
+#  TimescaleDB shm_size                  8gb        18gb         36gb
+#  TimescaleDB container memory limit    10g         20g         40g
 ###############################################################################
