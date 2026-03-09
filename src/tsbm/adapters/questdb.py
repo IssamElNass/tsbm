@@ -174,13 +174,16 @@ class QuestDBAdapter:
             raise IngestionError("call create_table() before ingest_batch()")
 
         schema = self._schema
-        conf_str = f"http::addr={self._config.host}:{self._config.ilp_port};"
+        conf_str = (
+            f"http::addr={self._config.host}:{self._config.ilp_port};"
+            f"auto_flush_rows=1000000;auto_flush_interval=off;"
+        )
         symbols = [c.name for c in schema.columns if c.role == ColumnRole.TAG]
         ts_col = schema.timestamp_col
         n_rows = len(table)
         n_bytes = estimate_table_bytes(table)
 
-        _PANDAS_CHUNK = 100_000  # rows per pandas conversion to cap peak memory
+        _PANDAS_CHUNK = 500_000  # rows per pandas conversion
 
         def _sync_send() -> TimingResult:
             from questdb.ingress import Sender  # noqa: PLC0415
@@ -191,44 +194,32 @@ class QuestDBAdapter:
                 self._sender.__enter__()
 
             with timed_operation(rows=n_rows, bytes_count=n_bytes, disable_gc=False) as result:
-                # Process in sub-chunks to avoid doubling memory with a
-                # full pandas copy on billion-row workloads.
                 for offset in range(0, n_rows, _PANDAS_CHUNK):
                     sub_table = table.slice(offset, min(_PANDAS_CHUNK, n_rows - offset))
-                    sub_df = _table_to_pandas_safe(sub_table, schema)
+                    sub_df = _table_to_pandas_safe(sub_table, schema, batch_offset=offset)
                     self._sender.dataframe(
                         sub_df,
                         table_name=table_name,
                         symbols=symbols,
                         at=ts_col,
                     )
+                # Auto-flush handles batching internally; explicit flush
+                # only at the end to ensure all buffered rows are committed.
                 self._sender.flush()
             return result
 
         await self._ensure_connected()
-        max_retries = 3
-        last_exc: Exception | None = None
-        for attempt in range(max_retries):
-            try:
-                return await asyncio.to_thread(_sync_send)
-            except Exception as exc:
-                # Close stale sender so next attempt creates a fresh one
-                if self._sender is not None:
-                    try:
-                        self._sender.__exit__(None, None, None)
-                    except Exception:
-                        pass
-                    self._sender = None
-                last_exc = exc
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        "QuestDB ingest_batch attempt %d/%d failed: %s — retrying",
-                        attempt + 1, max_retries, exc,
-                    )
-                    await asyncio.sleep(1.0 * (attempt + 1))
-        raise IngestionError(
-            f"QuestDB ingest_batch failed after {max_retries} attempts: {last_exc}"
-        ) from last_exc
+        try:
+            return await asyncio.to_thread(_sync_send)
+        except Exception as exc:
+            # Close the sender so next call (if any) creates a fresh one
+            if self._sender is not None:
+                try:
+                    self._sender.__exit__(None, None, None)
+                except Exception:
+                    pass
+                self._sender = None
+            raise IngestionError(f"QuestDB ingest_batch failed: {exc}") from exc
 
     async def flush(self, expected_rows: int | None = None) -> None:
         """
@@ -505,7 +496,7 @@ async def _wait_for_mv_refresh(
     )
 
 
-def _table_to_pandas_safe(table: pa.Table, schema: DatasetSchema) -> pd.DataFrame:
+def _table_to_pandas_safe(table: pa.Table, schema: DatasetSchema, batch_offset: int = 0) -> pd.DataFrame:
     """
     Convert an Arrow table to pandas without triggering the PyArrow Windows
     timezone-database requirement.
@@ -522,6 +513,7 @@ def _table_to_pandas_safe(table: pa.Table, schema: DatasetSchema) -> pd.DataFram
     import pyarrow.compute as pc  # noqa: PLC0415
 
     # Drop rows with nulls — QuestDB ILP Sender.dataframe() rejects NaN / None.
+    # Bad rows are logged to questdb_bad_rows.log with their record numbers.
     null_cols = [
         (col_spec.name, table.column(col_spec.name).null_count)
         for col_spec in schema.columns
@@ -533,6 +525,28 @@ def _table_to_pandas_safe(table: pa.Table, schema: DatasetSchema) -> pd.DataFram
         for name, _ in null_cols:
             col_valid = pc.is_valid(table.column(name))
             mask = col_valid if mask is None else pc.and_(mask, col_valid)
+
+        # Log each bad row to file before dropping
+        inverted = pc.invert(mask)
+        bad_indices = pc.indices_nonzero(inverted).to_pylist()
+        if bad_indices:
+            import pathlib  # noqa: PLC0415
+            bad_log = pathlib.Path("questdb_bad_rows.log")
+            with bad_log.open("a", encoding="utf-8") as f:
+                for idx in bad_indices:
+                    row = {col_spec.name: table.column(col_spec.name)[idx].as_py()
+                           for col_spec in schema.columns}
+                    null_fields = [n for n, _ in null_cols
+                                   if table.column(n)[idx].as_py() is None]
+                    f.write(
+                        f"record={batch_offset + idx} "
+                        f"null_columns={null_fields} "
+                        f"row={row}\n"
+                    )
+            logger.warning(
+                "QuestDB: logged %d bad rows to %s", len(bad_indices), bad_log.resolve(),
+            )
+
         table = table.filter(mask)
         dropped = before - len(table)
         for name, count in null_cols:

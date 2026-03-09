@@ -188,46 +188,34 @@ class CrateDBAdapter:
         await self._ensure_connected()
         url = f"http://{self._config.host}:{self._config.http_port}/_sql"
 
-        max_retries = 3
-        last_exc: Exception | None = None
-        for attempt in range(max_retries):
-            try:
-                with timed_operation(rows=n_rows, bytes_count=n_bytes) as result:
-                    for chunk_start in range(0, len(bulk_args), _HTTP_BULK_CHUNK):
-                        chunk_args = bulk_args[chunk_start:chunk_start + _HTTP_BULK_CHUNK]
-                        payload: dict[str, Any] = {"stmt": stmt, "bulk_args": chunk_args}
-                        async with self._http_session.post(  # type: ignore[union-attr]
-                            url,
-                            json=payload,
-                        ) as resp:
-                            if resp.status != 200:
-                                body = await resp.text()
-                                raise IngestionError(
-                                    f"CrateDB HTTP bulk insert failed (HTTP {resp.status}): {body}"
-                                )
-                            resp_json = await resp.json()
-                            # Check for per-row errors in the results array
-                            results = resp_json.get("results", [])
-                            errors = [r for r in results if r.get("rowcount", 0) < 0]
-                            if errors:
-                                raise IngestionError(
-                                    f"CrateDB bulk insert had {len(errors)} row errors "
-                                    f"out of {len(results)} batches"
-                                )
-                return result
-            except IngestionError:
-                raise
-            except Exception as exc:
-                last_exc = exc
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        "CrateDB ingest_batch attempt %d/%d failed: %s — retrying",
-                        attempt + 1, max_retries, exc,
-                    )
-                    await asyncio.sleep(1.0 * (attempt + 1))
-        raise IngestionError(
-            f"CrateDB ingest_batch failed after {max_retries} attempts: {last_exc}"
-        ) from last_exc
+        try:
+            with timed_operation(rows=n_rows, bytes_count=n_bytes) as result:
+                for chunk_start in range(0, len(bulk_args), _HTTP_BULK_CHUNK):
+                    chunk_args = bulk_args[chunk_start:chunk_start + _HTTP_BULK_CHUNK]
+                    payload: dict[str, Any] = {"stmt": stmt, "bulk_args": chunk_args}
+                    async with self._http_session.post(  # type: ignore[union-attr]
+                        url,
+                        json=payload,
+                    ) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            raise IngestionError(
+                                f"CrateDB HTTP bulk insert failed (HTTP {resp.status}): {body}"
+                            )
+                        resp_json = await resp.json()
+                        # Check for per-row errors in the results array
+                        results = resp_json.get("results", [])
+                        errors = [r for r in results if r.get("rowcount", 0) < 0]
+                        if errors:
+                            raise IngestionError(
+                                f"CrateDB bulk insert had {len(errors)} row errors "
+                                f"out of {len(results)} batches"
+                            )
+            return result
+        except IngestionError:
+            raise
+        except Exception as exc:
+            raise IngestionError(f"CrateDB ingest_batch failed: {exc}") from exc
 
     async def flush(self, expected_rows: int | None = None) -> None:
         """
