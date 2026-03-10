@@ -93,6 +93,10 @@ class WorkloadConfig(BaseModel):
     # 0 = disabled (default).  Only effective when reset_between_rounds = false;
     # if reset_between_rounds = true the seed is wiped at the start of each round.
     ingestion_seed_rows: int = 0
+    # Number of concurrent ingest workers used during data seeding.
+    # Each worker gets its own adapter/connection and pulls batches from a shared queue.
+    # Higher values increase throughput but use more memory and connections.
+    seed_workers: int = 4
     # Explicit timestamp column name. Leave empty ("") for auto-detection.
     # Set this when the dataset's timestamp column has a non-standard name
     # (i.e. not one of: time, ts, timestamp, datetime, date, created_at, event_time).

@@ -238,6 +238,14 @@ late_arrival_batch_size = 10_000
 # dropped at the start of each measurement round, wiping the seed rows.
 ingestion_seed_rows = 0
 
+# Concurrent ingest workers used during data seeding (tsbm run / tsbm load).
+# Each worker gets its own adapter connection and pulls batches from a shared queue.
+# Higher values increase throughput but use more memory and connections.
+#   1  = sequential (safe default)
+#   4  = good for SSDs + fast network
+#   8+ = for NVMe + high-bandwidth DB hosts
+seed_workers = 4
+
 # ── Results storage ───────────────────────────────────────────────────────────
 
 [results]

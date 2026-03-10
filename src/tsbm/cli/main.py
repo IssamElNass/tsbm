@@ -82,6 +82,13 @@ def cmd_run(
         bool,
         typer.Option("--verbose", "-v", help="Enable debug logging."),
     ] = False,
+    skip_seed: Annotated[
+        bool,
+        typer.Option(
+            "--skip-seed/--seed",
+            help="Skip data seeding; assume tables are already populated from a previous run.",
+        ),
+    ] = False,
 ) -> None:
     """Run a benchmark workload against one or more databases."""
     _setup_logging(verbose)
@@ -96,6 +103,7 @@ def cmd_run(
         timestamp_col=timestamp_col,
         dataset_list=dataset_list,
         verbose=verbose,
+        skip_seed=skip_seed,
     ))
 
 

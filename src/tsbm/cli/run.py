@@ -214,6 +214,7 @@ async def async_run(
     timestamp_col: str | None = None,
     dataset_list: list[str] | None = None,
     verbose: bool = False,
+    skip_seed: bool = False,
 ) -> None:
     """Full orchestration for the ``tsbm run`` command."""
 
@@ -395,8 +396,14 @@ async def async_run(
         wl in _NEEDS_SEED_BENCHMARKS and wl not in _ALWAYS_RESET_BENCHMARKS
         for wl in workload_names
     )
-    if first_needs_seed:
-        await _parallel_seed_adapters(adapters, dataset, seeded_adapters)
+    if skip_seed:
+        console.print("[yellow]--skip-seed: skipping data seeding — assuming tables are populated[/yellow]")
+        seeded_adapters.update(a.name for a in adapters)
+    elif first_needs_seed:
+        await _parallel_seed_adapters(
+            adapters, dataset, seeded_adapters,
+            seed_workers=settings.workload.seed_workers,
+        )
 
     # ----------------------------------------------------------------
     # 7. Run each benchmark
@@ -439,24 +446,216 @@ async def async_run(
         _print_metric_glossary()
 
 
+_CHECKPOINT_PATH = Path(".tsbm_seed_checkpoint.json")
+
+
+def _load_checkpoint() -> dict[str, Any]:
+    """Load the seed checkpoint file, or return an empty dict."""
+    if _CHECKPOINT_PATH.exists():
+        try:
+            return json.loads(_CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_checkpoint(data: dict[str, Any]) -> None:
+    """Atomically write the seed checkpoint file."""
+    tmp = _CHECKPOINT_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+    tmp.replace(_CHECKPOINT_PATH)
+
+
+def _format_rate(rows_per_sec: float) -> str:
+    """Format a rows/sec value into a human-readable string."""
+    if rows_per_sec >= 1_000_000:
+        return f"{rows_per_sec / 1_000_000:.2f}M rows/s"
+    if rows_per_sec >= 1_000:
+        return f"{rows_per_sec / 1_000:.1f}K rows/s"
+    return f"{rows_per_sec:.0f} rows/s"
+
+
 async def _seed_one_adapter(
     adapter: Any,
     dataset: Any,
+    on_progress: Any | None = None,
+    seed_workers: int = 1,
 ) -> None:
-    """Connect to *adapter*, drop/create table, and ingest the full dataset."""
+    """Connect to *adapter*, drop/create table, and ingest the full dataset.
+
+    When *seed_workers* > 1, multiple adapter clones ingest batches concurrently
+    via an ``asyncio.Queue``.  Each clone has its own DB connection / ILP sender.
+
+    When the dataset has multiple source files (``source_paths``), a checkpoint
+    file tracks which sources have been completed.  On restart, already-completed
+    sources are skipped and the table is not dropped/recreated.
+
+    *on_progress* is an optional callback ``(rows_ingested, rows_per_sec, source_idx, total_sources, filename)``
+    called after each batch to report live throughput.
+    """
+    import time as _time  # noqa: PLC0415
+    import pyarrow as pa  # noqa: PLC0415
+    from tsbm.adapters.registry import get_adapter  # noqa: PLC0415
+    from tsbm.datasets.loader import _iter_dataset_batches, _iter_azure_batches  # noqa: PLC0415
+
     await adapter.connect()
     try:
-        await adapter.drop_table(dataset.schema.name)
-        await adapter.create_table(dataset.schema)
-        rows_ingested = 0
-        if dataset.streaming:
-            for chunk in dataset.iter_batches():
-                await adapter.ingest_batch(chunk, dataset.schema.name)
-                rows_ingested += len(chunk)
+        table_name = dataset.schema.name
+        has_sources = bool(getattr(dataset, "source_paths", None))
+
+        # --- checkpoint resume logic (multi-source only) ---
+        checkpoint = _load_checkpoint()
+        adapter_ckpt = checkpoint.get(adapter.name, {})
+        resuming = (
+            has_sources
+            and adapter_ckpt.get("table_name") == table_name
+            and adapter_ckpt.get("completed_sources")
+        )
+
+        if resuming:
+            completed_set = set(adapter_ckpt["completed_sources"])
+            rows_ingested = adapter_ckpt.get("rows_ingested", 0)
+            logger.info(
+                "Resuming %s seed: %d sources done, %d rows so far",
+                adapter.name, len(completed_set), rows_ingested,
+            )
         else:
-            tbl = dataset.load()
-            await adapter.ingest_batch(tbl, dataset.schema.name)
-            rows_ingested = len(tbl)
+            completed_set: set[str] = set()
+            rows_ingested = 0
+            await adapter.drop_table(table_name)
+            await adapter.create_table(dataset.schema)
+            checkpoint[adapter.name] = {
+                "table_name": table_name,
+                "completed_sources": [],
+                "rows_ingested": 0,
+            }
+            _save_checkpoint(checkpoint)
+
+        seed_start = _time.monotonic()
+        n_workers = max(1, seed_workers)
+
+        _current_file = [""]
+
+        def _report() -> None:
+            if on_progress is not None:
+                elapsed = _time.monotonic() - seed_start
+                rate = rows_ingested / elapsed if elapsed > 0 else 0
+                on_progress(rows_ingested, rate, _current_src[0], _total_src[0], _current_file[0])
+
+        _current_src = [0]
+        _total_src = [1]
+
+        # --- parallel worker infrastructure ---
+        _SENTINEL = None  # signals workers to stop
+
+        async def _worker(worker_adapter: Any) -> None:
+            """Pull batches from the queue and ingest them."""
+            nonlocal rows_ingested
+            while True:
+                item = await queue.get()
+                if item is _SENTINEL:
+                    queue.task_done()
+                    break
+                tbl = item
+                try:
+                    await worker_adapter.ingest_batch(tbl, table_name)
+                    rows_ingested += len(tbl)
+                    _report()
+                except Exception:
+                    # Re-queue failed batch once, then let it propagate
+                    logger.warning("%s: worker ingest failed, retrying batch", adapter.name)
+                    try:
+                        await worker_adapter.ingest_batch(tbl, table_name)
+                        rows_ingested += len(tbl)
+                        _report()
+                    except Exception as exc2:
+                        logger.error("%s: worker ingest retry failed: %s", adapter.name, exc2)
+                        raise
+                finally:
+                    queue.task_done()
+
+        # Create worker adapter clones (each gets its own connection + sender)
+        worker_adapters: list[Any] = []
+        if n_workers > 1:
+            for _ in range(n_workers):
+                clone = get_adapter(adapter.name)
+                await clone.connect()
+                # Copy the schema so ingest_batch works
+                if hasattr(adapter, "_schema"):
+                    clone._schema = adapter._schema
+                if hasattr(adapter, "_current_table"):
+                    clone._current_table = adapter._current_table
+                worker_adapters.append(clone)
+        else:
+            worker_adapters.append(adapter)
+
+        queue: asyncio.Queue[pa.Table | None] = asyncio.Queue(maxsize=n_workers * 2)
+
+        # Start worker tasks
+        worker_tasks = [asyncio.create_task(_worker(wa)) for wa in worker_adapters]
+
+        try:
+            if has_sources:
+                _total_src[0] = len(dataset.source_paths)
+                for src_idx, source in enumerate(dataset.source_paths):
+                    source_key = str(source)
+                    if source_key in completed_set:
+                        continue
+                    _current_src[0] = src_idx + 1
+                    _current_file[0] = Path(source_key).name if isinstance(source, Path) else source_key.rsplit("/", 1)[-1]
+                    if isinstance(source, Path):
+                        batches = _iter_dataset_batches(source, dataset.chunk_size)
+                    else:
+                        batches = _iter_azure_batches(
+                            source, dataset.chunk_size,
+                            getattr(dataset, "_azure_connection_string", ""),
+                            getattr(dataset, "_azure_sas_token", ""),
+                            getattr(dataset, "_azure_account_name", ""),
+                        )
+                    for batch in batches:
+                        tbl = pa.Table.from_batches([batch]) if not isinstance(batch, pa.Table) else batch
+                        await queue.put(tbl)
+
+                    # Wait for all queued batches to finish before checkpointing
+                    await queue.join()
+
+                    checkpoint = _load_checkpoint()
+                    ckpt = checkpoint.setdefault(adapter.name, {
+                        "table_name": table_name,
+                        "completed_sources": [],
+                        "rows_ingested": 0,
+                    })
+                    ckpt["completed_sources"].append(source_key)
+                    ckpt["rows_ingested"] = rows_ingested
+                    _save_checkpoint(checkpoint)
+                    console.print(
+                        f"  [green]done[/green] [cyan]{adapter.name}[/cyan] "
+                        f"file {src_idx + 1}/{_total_src[0]}: [bold]{_current_file[0]}[/bold] "
+                        f"({rows_ingested:,} rows total)"
+                    )
+            elif dataset.streaming:
+                for chunk in dataset.iter_batches():
+                    await queue.put(chunk)
+            else:
+                tbl = dataset.load()
+                await queue.put(tbl)
+
+            # Wait for remaining batches
+            await queue.join()
+        finally:
+            # Signal all workers to stop
+            for _ in worker_tasks:
+                await queue.put(_SENTINEL)
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+            # Disconnect worker clones (not the main adapter)
+            if n_workers > 1:
+                for wa in worker_adapters:
+                    try:
+                        await wa.disconnect()
+                    except Exception:
+                        pass
+
         await adapter.flush(expected_rows=rows_ingested)
     finally:
         await adapter.disconnect()
@@ -466,6 +665,7 @@ async def _parallel_seed_adapters(
     adapters: list[Any],
     dataset: Any,
     seeded_adapters: set[str],
+    seed_workers: int = 1,
 ) -> None:
     """Seed all *adapters* with the full dataset in parallel."""
     with Progress(
@@ -483,8 +683,27 @@ async def _parallel_seed_adapters(
             tasks_map[adapter.name] = tid
 
         async def _seed_with_progress(adapter: Any) -> None:
+            def _on_progress(rows: int, rate: float, src_idx: int, total_src: int, filename: str = "") -> None:
+                rate_str = _format_rate(rate)
+                if total_src > 1:
+                    progress.update(
+                        tasks_map[adapter.name],
+                        description=(
+                            f"[cyan]{adapter.name}[/cyan] "
+                            f"[dim]{rows:,} rows — {rate_str} — {filename} ({src_idx}/{total_src})[/dim]"
+                        ),
+                    )
+                else:
+                    progress.update(
+                        tasks_map[adapter.name],
+                        description=(
+                            f"[cyan]{adapter.name}[/cyan] "
+                            f"[dim]{rows:,} rows — {rate_str}[/dim]"
+                        ),
+                    )
+
             try:
-                await _seed_one_adapter(adapter, dataset)
+                await _seed_one_adapter(adapter, dataset, on_progress=_on_progress, seed_workers=seed_workers)
                 seeded_adapters.add(adapter.name)
                 progress.update(
                     tasks_map[adapter.name],
@@ -584,12 +803,20 @@ async def _run_adapters_for_workload(
                         # Pre-load the full dataset before the benchmark runs.
                         # In streaming mode, chunks are fed one at a time to
                         # avoid loading the whole dataset into RAM at once.
+                        import time as _time  # noqa: PLC0415
                         progress.update(db_task, description=f"{task_desc} [dim]loading data…[/dim]")
                         rows_ingested = 0
+                        _seed_t0 = _time.monotonic()
                         if dataset.streaming:
                             for _chunk in dataset.iter_batches():
                                 await adapter.ingest_batch(_chunk, dataset.schema.name)
                                 rows_ingested += len(_chunk)
+                                _elapsed = _time.monotonic() - _seed_t0
+                                _rate = rows_ingested / _elapsed if _elapsed > 0 else 0
+                                progress.update(
+                                    db_task,
+                                    description=f"{task_desc} [dim]{rows_ingested:,} rows — {_format_rate(_rate)}[/dim]",
+                                )
                         else:
                             _tbl = dataset.load()
                             await adapter.ingest_batch(_tbl, dataset.schema.name)

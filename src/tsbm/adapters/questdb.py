@@ -209,17 +209,36 @@ class QuestDBAdapter:
             return result
 
         await self._ensure_connected()
-        try:
-            return await asyncio.to_thread(_sync_send)
-        except Exception as exc:
-            # Close the sender so next call (if any) creates a fresh one
-            if self._sender is not None:
-                try:
-                    self._sender.__exit__(None, None, None)
-                except Exception:
-                    pass
-                self._sender = None
-            raise IngestionError(f"QuestDB ingest_batch failed: {exc}") from exc
+
+        _RETRYABLE_MSGS = ("connection reset", "connection aborted", "broken pipe", "timed out", "eof occurred")
+        max_retries = 3
+
+        for attempt in range(max_retries):
+            try:
+                return await asyncio.to_thread(_sync_send)
+            except Exception as exc:
+                # Close the sender so next attempt creates a fresh connection
+                if self._sender is not None:
+                    try:
+                        self._sender.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                    self._sender = None
+
+                exc_lower = str(exc).lower()
+                is_retryable = any(msg in exc_lower for msg in _RETRYABLE_MSGS)
+
+                if is_retryable and attempt < max_retries - 1:
+                    wait = 2 ** attempt  # 1s, 2s
+                    logger.warning(
+                        "QuestDB: ingest_batch attempt %d/%d failed (%s), retrying in %ds",
+                        attempt + 1, max_retries, exc, wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                raise IngestionError(f"QuestDB ingest_batch failed: {exc}") from exc
+
+        raise IngestionError("QuestDB ingest_batch failed: exhausted retries")
 
     async def flush(self, expected_rows: int | None = None) -> None:
         """
@@ -230,8 +249,14 @@ class QuestDBAdapter:
         ``get_row_count()`` until visibility is confirmed.
         """
         if expected_rows is not None and self._current_table:
+            # Scale timeout: 60s base + 1s per 10M rows, capped at 1 hour
+            timeout = min(3600.0, 60.0 + expected_rows / 10_000_000)
+            # Scale poll interval: 0.5s for small, up to 5s for billions
+            poll = min(5.0, 0.5 + expected_rows / 1_000_000_000)
             await self.wait_for_visibility(
-                self._current_table, expected_rows
+                self._current_table, expected_rows,
+                timeout_seconds=timeout,
+                poll_interval=poll,
             )
 
     async def wait_for_visibility(
@@ -506,56 +531,32 @@ def _table_to_pandas_safe(table: pa.Table, schema: DatasetSchema, batch_offset: 
     needs tzdata on Windows.  Using a numpy array instead of a Python list
     as the intermediate avoids O(n) Python object creation overhead.
 
-    Null values in Arrow columns are dropped before conversion because the
-    QuestDB ILP ``Sender.dataframe()`` rejects NaN / None with
-    ``IngressError``.
+    Null values in non-timestamp columns are filled with defaults so the
+    QuestDB ILP ``Sender.dataframe()`` does not reject the batch:
+    tags/other → ``""``, metrics → ``-1``.
     """
     import pyarrow.compute as pc  # noqa: PLC0415
 
-    # Drop rows with nulls — QuestDB ILP Sender.dataframe() rejects NaN / None.
-    # Bad rows are logged to questdb_bad_rows.log with their record numbers.
-    null_cols = [
-        (col_spec.name, table.column(col_spec.name).null_count)
-        for col_spec in schema.columns
-        if table.column(col_spec.name).null_count > 0
-    ]
-    if null_cols:
-        before = len(table)
-        mask = None
-        for name, _ in null_cols:
-            col_valid = pc.is_valid(table.column(name))
-            mask = col_valid if mask is None else pc.and_(mask, col_valid)
-
-        # Log each bad row to file before dropping
-        inverted = pc.invert(mask)
-        bad_indices = pc.indices_nonzero(inverted).to_pylist()
-        if bad_indices:
-            import pathlib  # noqa: PLC0415
-            bad_log = pathlib.Path("questdb_bad_rows.log")
-            with bad_log.open("a", encoding="utf-8") as f:
-                for idx in bad_indices:
-                    row = {col_spec.name: table.column(col_spec.name)[idx].as_py()
-                           for col_spec in schema.columns}
-                    null_fields = [n for n, _ in null_cols
-                                   if table.column(n)[idx].as_py() is None]
-                    f.write(
-                        f"record={batch_offset + idx} "
-                        f"null_columns={null_fields} "
-                        f"row={row}\n"
-                    )
-            logger.warning(
-                "QuestDB: logged %d bad rows to %s", len(bad_indices), bad_log.resolve(),
+    # Fill nulls with defaults — QuestDB ILP Sender.dataframe() rejects NaN / None.
+    for col_spec in schema.columns:
+        col = table.column(col_spec.name)
+        if col.null_count == 0:
+            continue
+        if col_spec.role == ColumnRole.TIMESTAMP:
+            # Timestamp nulls are genuinely corrupt — log and let Sender reject.
+            logger.error(
+                "QuestDB: column %r has %d null timestamps — these rows will be rejected",
+                col_spec.name, col.null_count,
             )
-
-        table = table.filter(mask)
-        dropped = before - len(table)
-        for name, count in null_cols:
-            logger.warning(
-                "QuestDB: column %r has %d nulls", name, count,
-            )
-        logger.warning(
-            "QuestDB: dropped %d rows with nulls (%d remaining)", dropped, len(table),
-        )
+            continue
+        if col_spec.role in (ColumnRole.TAG, ColumnRole.OTHER):
+            filled = pc.if_else(pc.is_valid(col), col, "")
+        else:
+            # METRIC — fill with -1 sentinel
+            fill_scalar = pa.scalar(-1, type=col.type)
+            filled = pc.if_else(pc.is_valid(col), col, fill_scalar)
+        idx = table.schema.get_field_index(col_spec.name)
+        table = table.set_column(idx, col_spec.name, filled)
 
     cols: dict[str, object] = {}
     for col_spec in schema.columns:
