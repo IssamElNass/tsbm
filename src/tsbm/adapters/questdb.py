@@ -186,7 +186,17 @@ class QuestDBAdapter:
         _PANDAS_CHUNK = 500_000  # rows per pandas conversion
 
         def _sync_send() -> TimingResult:
+            import pyarrow.compute as pc  # noqa: PLC0415
             from questdb.ingress import Sender  # noqa: PLC0415
+
+            nonlocal table, n_rows, n_bytes
+
+            # Silently drop rows with null timestamps — QuestDB rejects them anyway
+            ts_col_arr = table.column(ts_col)
+            if ts_col_arr.null_count > 0:
+                table = table.filter(pc.is_valid(ts_col_arr))
+                n_rows = len(table)
+                n_bytes = estimate_table_bytes(table)
 
             # Reuse sender across batches — avoids HTTP connection setup per call
             if self._sender is None:
@@ -282,6 +292,26 @@ class QuestDBAdapter:
             expected_rows, table_name, timeout_seconds,
         )
         return False
+
+    async def get_wal_lag(self, table_name: str) -> int:
+        """Return the number of uncommitted WAL segments for *table_name*.
+
+        Uses ``wal_tables()`` which exposes ``sequencerTxn`` (latest committed)
+        and ``writerTxn`` (latest applied).  The difference is the WAL lag.
+        Returns 0 if the table is not WAL-enabled or on any error.
+        """
+        try:
+            await self._ensure_connected()
+            row = await self._pool.fetchrow(  # type: ignore[union-attr]
+                "SELECT sequencerTxn, writerTxn FROM wal_tables() "
+                "WHERE name = $1",
+                table_name,
+            )
+            if row is None:
+                return 0
+            return max(0, int(row["sequencerTxn"]) - int(row["writerTxn"]))
+        except Exception:
+            return 0
 
     # ------------------------------------------------------------------
     # Query
@@ -543,11 +573,6 @@ def _table_to_pandas_safe(table: pa.Table, schema: DatasetSchema, batch_offset: 
         if col.null_count == 0:
             continue
         if col_spec.role == ColumnRole.TIMESTAMP:
-            # Timestamp nulls are genuinely corrupt — log and let Sender reject.
-            logger.error(
-                "QuestDB: column %r has %d null timestamps — these rows will be rejected",
-                col_spec.name, col.null_count,
-            )
             continue
         if col_spec.role in (ColumnRole.TAG, ColumnRole.OTHER):
             filled = pc.if_else(pc.is_valid(col), col, "")

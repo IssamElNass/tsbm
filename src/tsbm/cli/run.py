@@ -545,6 +545,25 @@ async def _seed_one_adapter(
         _current_src = [0]
         _total_src = [1]
 
+        # --- WAL backpressure (QuestDB only) ---
+        _WAL_LAG_THRESHOLD = 50  # pause when WAL lag exceeds this many txns
+        _WAL_LAG_POLL = 2.0  # seconds between WAL lag checks while paused
+        _has_wal_check = hasattr(adapter, "get_wal_lag")
+
+        async def _wait_for_wal() -> None:
+            """Block until QuestDB WAL lag drops below threshold."""
+            if not _has_wal_check:
+                return
+            while True:
+                lag = await adapter.get_wal_lag(table_name)
+                if lag < _WAL_LAG_THRESHOLD:
+                    return
+                logger.info(
+                    "QuestDB: WAL lag %d txns — pausing seeding until lag < %d",
+                    lag, _WAL_LAG_THRESHOLD,
+                )
+                await asyncio.sleep(_WAL_LAG_POLL)
+
         # --- parallel worker infrastructure ---
         _SENTINEL = None  # signals workers to stop
 
@@ -558,15 +577,15 @@ async def _seed_one_adapter(
                     break
                 tbl = item
                 try:
-                    await worker_adapter.ingest_batch(tbl, table_name)
-                    rows_ingested += len(tbl)
+                    result = await worker_adapter.ingest_batch(tbl, table_name)
+                    rows_ingested += result.rows
                     _report()
                 except Exception:
                     # Re-queue failed batch once, then let it propagate
                     logger.warning("%s: worker ingest failed, retrying batch", adapter.name)
                     try:
-                        await worker_adapter.ingest_batch(tbl, table_name)
-                        rows_ingested += len(tbl)
+                        result = await worker_adapter.ingest_batch(tbl, table_name)
+                        rows_ingested += result.rows
                         _report()
                     except Exception as exc2:
                         logger.error("%s: worker ingest retry failed: %s", adapter.name, exc2)
@@ -614,6 +633,7 @@ async def _seed_one_adapter(
                         )
                     for batch in batches:
                         tbl = pa.Table.from_batches([batch]) if not isinstance(batch, pa.Table) else batch
+                        await _wait_for_wal()
                         await queue.put(tbl)
 
                     # Wait for all queued batches to finish before checkpointing
@@ -635,6 +655,7 @@ async def _seed_one_adapter(
                     )
             elif dataset.streaming:
                 for chunk in dataset.iter_batches():
+                    await _wait_for_wal()
                     await queue.put(chunk)
             else:
                 tbl = dataset.load()
