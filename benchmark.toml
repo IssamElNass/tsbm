@@ -31,6 +31,9 @@ pg_port      = 8812
 # Use HOUR for dense datasets (millions of rows per day) or high-frequency
 # time-range queries on short windows.  DAY is the safe default.
 partition_by = "HOUR"
+# QuestDB WAL apply is the server-side bottleneck — fewer workers with larger
+# batches outperforms many workers.  2-4 is optimal; 0 = use global seed_workers.
+seed_workers = 3
 
 [databases.cratedb]
 enabled   = true
@@ -200,10 +203,11 @@ streaming_threshold_rows = 2_000_000
 # Rows per streaming chunk.
 # Larger = fewer round-trips, better ingestion throughput, more RAM per chunk.
 # At ~70 bytes/row:
-#   2_000_000 rows ≈ 140 MB per chunk
-#   5_000_000 rows ≈ 350 MB per chunk
-# For billion-row datasets, 5M keeps round-trips to ~200 while fitting in RAM.
-chunk_size = 5_000_000
+#   2_000_000 rows ≈ 140 MB per chunk  ← good for 32 GB with 8 workers
+#   5_000_000 rows ≈ 350 MB per chunk  ← use on 64 GB+ machines
+# Memory budget: workers × queue_depth(4) × chunk_size × 70 bytes
+#   8 workers × 4 × 2M × 70 bytes ≈ 4.5 GB
+chunk_size = 2_000_000
 
 # ── Timestamp column override ─────────────────────────────────────────────────
 # By default the timestamp column is auto-detected by name (time, ts, timestamp,
@@ -259,7 +263,7 @@ ingestion_seed_rows = 0
 #   1  = sequential (safe default)
 #   4  = good for SSDs + fast network
 #   8+ = for NVMe + high-bandwidth DB hosts
-seed_workers = 4
+seed_workers = 8
 
 # ── Results storage ───────────────────────────────────────────────────────────
 

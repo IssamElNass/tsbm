@@ -188,14 +188,17 @@ class QuestDBAdapter:
         conf_str = (
             f"http::addr={self._config.host}:{self._config.ilp_port};"
             f"auto_flush_rows=150000;auto_flush_interval=off;"
-            f"init_buf_size=4194304;"
+            f"init_buf_size=16777216;"
+            f"request_timeout=60000;"
+            f"retry_timeout=0;"
+            f"request_min_throughput=1048576;"
         )
         symbols = [c.name for c in schema.columns if c.role == ColumnRole.TAG]
         ts_col = schema.timestamp_col
         n_rows = len(table)
         n_bytes = estimate_table_bytes(table)
 
-        _PANDAS_CHUNK = 1_000_000  # rows per pandas conversion
+        _PANDAS_CHUNK = 2_000_000  # rows per pandas conversion
 
         def _sync_send() -> TimingResult:
             import pyarrow.compute as pc  # noqa: PLC0415
@@ -568,40 +571,58 @@ def _table_to_pandas_safe(table: pa.Table, schema: DatasetSchema, batch_offset: 
     Convert an Arrow table to pandas without triggering the PyArrow Windows
     timezone-database requirement.
 
-    Timestamp columns are converted via int64 nanoseconds → numpy array →
-    ``pd.to_datetime`` to avoid ``pc.cast(timestamp_with_tz, …)`` which
-    needs tzdata on Windows.  Using a numpy array instead of a Python list
-    as the intermediate avoids O(n) Python object creation overhead.
+    Fast path: when no nulls are present (typical for generated datasets),
+    cast the timestamp column to tz-naive nanoseconds and call
+    ``table.to_pandas(zero_copy_only=False)`` — a single C++ operation that
+    avoids per-column Python overhead.
 
-    Null values in non-timestamp columns are filled with defaults so the
-    QuestDB ILP ``Sender.dataframe()`` does not reject the batch:
-    tags/other → ``""``, metrics → ``-1``.
+    Slow path (nulls present): fill nulls with defaults first, then convert
+    column-by-column so QuestDB ILP Sender.dataframe() does not reject the
+    batch.
     """
     import pyarrow.compute as pc  # noqa: PLC0415
 
-    # Fill nulls with defaults — QuestDB ILP Sender.dataframe() rejects NaN / None.
-    for col_spec in schema.columns:
-        col = table.column(col_spec.name)
-        if col.null_count == 0:
-            continue
-        if col_spec.role == ColumnRole.TIMESTAMP:
-            continue
-        if col_spec.role in (ColumnRole.TAG, ColumnRole.OTHER):
-            filled = pc.if_else(pc.is_valid(col), col, "")
-        else:
-            # METRIC — fill with -1 sentinel
-            fill_scalar = pa.scalar(-1, type=col.type)
-            filled = pc.if_else(pc.is_valid(col), col, fill_scalar)
-        idx = table.schema.get_field_index(col_spec.name)
-        table = table.set_column(idx, col_spec.name, filled)
+    # Check if any non-timestamp column has nulls
+    has_nulls = any(
+        table.column(c.name).null_count > 0
+        for c in schema.columns
+        if c.role != ColumnRole.TIMESTAMP
+    )
 
-    cols: dict[str, object] = {}
+    if has_nulls:
+        # Slow path: fill nulls with defaults per column
+        for col_spec in schema.columns:
+            col = table.column(col_spec.name)
+            if col.null_count == 0:
+                continue
+            if col_spec.role == ColumnRole.TIMESTAMP:
+                continue
+            if col_spec.role in (ColumnRole.TAG, ColumnRole.OTHER):
+                filled = pc.if_else(pc.is_valid(col), col, "")
+            else:
+                fill_scalar = pa.scalar(-1, type=col.type)
+                filled = pc.if_else(pc.is_valid(col), col, fill_scalar)
+            idx = table.schema.get_field_index(col_spec.name)
+            table = table.set_column(idx, col_spec.name, filled)
+
+    # Cast timestamp columns to tz-naive ns so to_pandas() doesn't need tzdata
     for col_spec in schema.columns:
-        raw = table.column(col_spec.name)
         if col_spec.role == ColumnRole.TIMESTAMP:
-            # int64 ns → numpy array (zero-copy) → pd.DatetimeIndex
-            ns_array = raw.cast(pa.int64()).to_numpy()
-            cols[col_spec.name] = pd.to_datetime(ns_array, unit="ns", utc=True)
-        else:
-            cols[col_spec.name] = raw.to_pylist()
-    return pd.DataFrame(cols)
+            idx = table.schema.get_field_index(col_spec.name)
+            raw = table.column(col_spec.name)
+            # Arrow timestamp[ns, UTC] → int64 ns → tz-naive timestamp[ns]
+            ns_arr = raw.cast(pa.int64())
+            naive_ts = ns_arr.cast(pa.timestamp("ns"))
+            table = table.set_column(idx, col_spec.name, naive_ts)
+
+    # Use ArrowDtype mapping: keeps all columns in Arrow memory format
+    # (zero-copy for numeric types), and the QuestDB native Sender reads
+    # Arrow buffers directly — no numpy conversion overhead.
+    df = table.to_pandas(types_mapper=pd.ArrowDtype)
+
+    # Restore UTC timezone on timestamp columns (in-place, no copy)
+    for col_spec in schema.columns:
+        if col_spec.role == ColumnRole.TIMESTAMP:
+            df[col_spec.name] = df[col_spec.name].dt.tz_localize("UTC")
+
+    return df

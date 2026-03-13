@@ -4,7 +4,7 @@
 # Optimised for a DEDICATED benchmark machine.
 # Do NOT use on a shared host — memory limits are tuned for exclusive use.
 #
-# Default target: 16 cores / 32 GB RAM
+# Target: 16 cores / 32 GB RAM / 2 TB high-IOPS SSD (~500 MB/s throughput)
 # Each setting has a comment showing what to change for larger machines:
 #   "# → 16c/64GB"  and  "# → 32c/128GB"
 #
@@ -88,11 +88,13 @@ services:
 
       # Rows per WAL segment before rolling to a new file.
       # Larger segments = fewer fsyncs but bigger recovery replay.
-      QDB_CAIRO_WAL_SEGMENT_ROLLOVER_ROW_COUNT: "500000"   # → 16c/64GB: 1000000  → 32c/128GB: 2000000
+      # High-IOPS disk can handle larger segments and fast recovery replay.
+      QDB_CAIRO_WAL_SEGMENT_ROLLOVER_ROW_COUNT: "2000000"  # 2M rows — high IOPS handles replay  → 32c/128GB: 4000000
 
       # Interval (ms) between WAL purge sweeps that reclaim applied segments.
       # Faster purge keeps disk usage low during sustained ingestion.
-      QDB_CAIRO_WAL_PURGE_INTERVAL: "5000"                 # 5 s (default 30 s)
+      # 2 TB disk allows relaxed purge but fast IOPS makes 3s cheap.
+      QDB_CAIRO_WAL_PURGE_INTERVAL: "3000"                 # 3 s (default 30 s)
 
       # Out-of-order commit lag (µs).  Rows arriving out-of-order within
       # this window are merged in memory rather than triggering O3 commits.
@@ -100,8 +102,8 @@ services:
       QDB_CAIRO_O3_MAX_LAG: "60000000"                     # 60 s  → 32c/128GB: 120000000
 
       # Writer data page size — larger pages reduce mmap overhead during
-      # sustained writes.  4 MB is optimal for bulk ingestion workloads.
-      QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE: "4194304"    # 4 MB (default 1 MB)
+      # sustained writes.  8 MB leverages high disk throughput (500 MB/s).
+      QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE: "8388608"    # 8 MB — matches 500 MB/s throughput  → default was 4 MB
 
       # Parallel WAL apply workers — match core count for maximum WAL drain speed.
       # Critical for 8B+ row ingestion to prevent WAL lag from stalling writers.
@@ -112,8 +114,8 @@ services:
       QDB_CAIRO_O3_COLUMN_MEMORY_SIZE: "8388608"           # 8 MB (default 1 MB)
 
       # ── Network ─────────────────────────────────────────────────────────
-      # 16 MB receive buffer handles large ILP batches in one read
-      QDB_LINE_HTTP_RECV_BUFFER_SIZE: "16777216"           # 16 MB  → 16c/64GB: 32 MB (33554432)  → 32c/128GB: 64 MB
+      # 32 MB receive buffer handles large ILP batches in one read
+      QDB_LINE_HTTP_RECV_BUFFER_SIZE: "33554432"           # 32 MB  → 16c/64GB: 64 MB (67108864)  → 32c/128GB: 128 MB
 
       # ILP HTTP worker threads — dedicated threads for ingestion pipeline.
       # Separate from HTTP_WORKER_COUNT (REST/console).  Match half the
@@ -304,16 +306,19 @@ services:
       -c enable_partitionwise_aggregate=on
       -c enable_partitionwise_join=on
       -c jit=off
-      -c random_page_cost=1.1
+      -c random_page_cost=1.0
       -c seq_page_cost=1.0
       -c default_statistics_target=500
 
+      -c effective_io_concurrency=200
+      -c maintenance_io_concurrency=10
+
       -c checkpoint_completion_target=0.9
       -c wal_buffers=64MB
-      -c max_wal_size=4GB                                  # → 16c/64GB: 8GB  → 32c/128GB: 16GB
-      -c min_wal_size=1GB                                  # → 16c/64GB: 2GB  → 32c/128GB: 4GB
+      -c max_wal_size=16GB                                 # 2 TB disk can afford large WAL  → 32c/128GB: 32GB
+      -c min_wal_size=4GB                                  # reduce checkpoint frequency  → 32c/128GB: 8GB
       -c synchronous_commit=off
-      -c bgwriter_lru_maxpages=200
+      -c bgwriter_lru_maxpages=400
       -c bgwriter_delay=50ms
 
       -c timescaledb.max_background_workers=32
@@ -366,11 +371,11 @@ services:
 #  QuestDB max uncommitted rows         2 000K     4 000K      8 000K    16 000K
 #  QuestDB WAL apply time quota         500 ms     500 ms    1 000 ms   1 000 ms
 #  QuestDB WAL apply workers               16         16          32         64
-#  QuestDB WAL segment rollover rows   500 000  1 000 000   2 000 000  4 000 000
-#  QuestDB WAL purge interval              5 s        5 s         5 s        5 s
+#  QuestDB WAL segment rollover rows 2 000 000  2 000 000   4 000 000  8 000 000
+#  QuestDB WAL purge interval              3 s        3 s         3 s        3 s
 #  QuestDB O3 max lag                     60 s       60 s       120 s      120 s
 #  QuestDB O3 column memory size         8 MB       8 MB        8 MB       16 MB
-#  QuestDB writer page size              4 MB       4 MB        4 MB        8 MB
+#  QuestDB writer page size              8 MB       8 MB        8 MB       16 MB
 #  QuestDB ILP recv buffer               16 MB      32 MB       64 MB     128 MB
 #  QuestDB ILP HTTP workers                 8          8          16         32
 #  ─────────────────────────────────────────────────────────────────────
@@ -380,6 +385,8 @@ services:
 #  CrateDB index buffer                 2048mb    4096mb      8192mb
 #  CrateDB search/write threadpool         16         16          32
 #  ─────────────────────────────────────────────────────────────────────
+#  TimescaleDB max_wal_size              16GB        16GB         32GB
+#  TimescaleDB min_wal_size               4GB         4GB          8GB
 #  TimescaleDB shared_buffers             6GB       16GB         32GB
 #  TimescaleDB effective_cache_size       8GB       48GB         96GB
 #  TimescaleDB work_mem                 256MB      512MB          1GB

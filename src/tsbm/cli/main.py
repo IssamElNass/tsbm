@@ -182,6 +182,10 @@ def cmd_load(
 
 @app.command("seed")
 def cmd_seed(
+    db: Annotated[
+        Optional[List[str]],
+        typer.Option("--db", "-d", help="Database(s) to target. Repeat for multiple. Default: all enabled."),
+    ] = None,
     config: Annotated[
         Optional[Path],
         typer.Option("--config", "-c", help="Path to benchmark.toml."),
@@ -207,7 +211,7 @@ def cmd_seed(
         typer.Option("--verbose", "-v", help="Enable debug logging."),
     ] = False,
 ) -> None:
-    """Seed QuestDB with the full dataset — no benchmarks.
+    """Seed one or more databases with the full dataset — no benchmarks.
 
     Uses parallel workers and WAL-lag throttling. Shows live rows/sec.
     """
@@ -215,6 +219,7 @@ def cmd_seed(
     dataset_path = Path(dataset[0]) if dataset and len(dataset) == 1 else None
     dataset_list = list(dataset) if dataset and len(dataset) > 1 else None
     asyncio.run(async_seed(
+        db_names=list(db) if db else None,
         config_path=config,
         dataset_path=dataset_path,
         dataset_list=dataset_list,

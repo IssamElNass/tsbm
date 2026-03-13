@@ -35,6 +35,11 @@ class QuestDBConfig(BaseModel):
     # Automatically add INDEX on SYMBOL (TAG) columns in CREATE TABLE DDL.
     # Indexes speed up WHERE filters on tag columns but double write I/O.
     index_symbols: bool = True
+    # Per-adapter seed worker override.  QuestDB's WAL apply is the bottleneck —
+    # flooding it with many concurrent writers creates WAL contention and hurts
+    # throughput.  2-4 workers with larger batches outperforms 8+ smaller ones.
+    # 0 = use the global workload.seed_workers value.
+    seed_workers: int = 0
 
 
 class CrateDBConfig(BaseModel):
@@ -82,7 +87,7 @@ class WorkloadConfig(BaseModel):
     reset_between_rounds: bool = False
     tag_cardinality_threshold: float = 0.05  # fraction of rows; below → TAG column
     streaming_threshold_rows: int = 500_000  # auto-enable streaming above this row count
-    chunk_size: int = 100_000               # rows per batch in streaming mode
+    chunk_size: int = 500_000               # rows per batch in streaming mode
     unit_conversions: dict[str, tuple[str, str]] = {}  # {"col": ("from_unit", "to_unit")}
     # Column overrides for query benchmarks.
     # By default every aggregation/GROUP BY uses the first metric/tag column in the
@@ -100,7 +105,7 @@ class WorkloadConfig(BaseModel):
     # Number of concurrent ingest workers used during data seeding.
     # Each worker gets its own adapter/connection and pulls batches from a shared queue.
     # Higher values increase throughput but use more memory and connections.
-    seed_workers: int = 4
+    seed_workers: int = 8
     # Explicit timestamp column name. Leave empty ("") for auto-detection.
     # Set this when the dataset's timestamp column has a non-standard name
     # (i.e. not one of: time, ts, timestamp, datetime, date, created_at, event_time).

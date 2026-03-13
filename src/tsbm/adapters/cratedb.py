@@ -47,7 +47,7 @@ from tsbm.metrics.timer import TimingResult, estimate_table_bytes, timed_operati
 logger = logging.getLogger(__name__)
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-_HTTP_BULK_CHUNK = 100_000  # max rows per HTTP POST to /_sql
+_HTTP_BULK_CHUNK = 250_000  # max rows per HTTP POST to /_sql
 
 
 class CrateDBAdapter:
@@ -188,29 +188,33 @@ class CrateDBAdapter:
         await self._ensure_connected()
         url = f"http://{self._config.host}:{self._config.http_port}/_sql"
 
+        async def _send_chunk(chunk_args: list) -> None:
+            payload: dict[str, Any] = {"stmt": stmt, "bulk_args": chunk_args}
+            async with self._http_session.post(  # type: ignore[union-attr]
+                url,
+                json=payload,
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise IngestionError(
+                        f"CrateDB HTTP bulk insert failed (HTTP {resp.status}): {body}"
+                    )
+                resp_json = await resp.json()
+                results = resp_json.get("results", [])
+                errors = [r for r in results if r.get("rowcount", 0) < 0]
+                if errors:
+                    raise IngestionError(
+                        f"CrateDB bulk insert had {len(errors)} row errors "
+                        f"out of {len(results)} batches"
+                    )
+
         try:
             with timed_operation(rows=n_rows, bytes_count=n_bytes) as result:
+                tasks = []
                 for chunk_start in range(0, len(bulk_args), _HTTP_BULK_CHUNK):
                     chunk_args = bulk_args[chunk_start:chunk_start + _HTTP_BULK_CHUNK]
-                    payload: dict[str, Any] = {"stmt": stmt, "bulk_args": chunk_args}
-                    async with self._http_session.post(  # type: ignore[union-attr]
-                        url,
-                        json=payload,
-                    ) as resp:
-                        if resp.status != 200:
-                            body = await resp.text()
-                            raise IngestionError(
-                                f"CrateDB HTTP bulk insert failed (HTTP {resp.status}): {body}"
-                            )
-                        resp_json = await resp.json()
-                        # Check for per-row errors in the results array
-                        results = resp_json.get("results", [])
-                        errors = [r for r in results if r.get("rowcount", 0) < 0]
-                        if errors:
-                            raise IngestionError(
-                                f"CrateDB bulk insert had {len(errors)} row errors "
-                                f"out of {len(results)} batches"
-                            )
+                    tasks.append(_send_chunk(chunk_args))
+                await asyncio.gather(*tasks)
             return result
         except IngestionError:
             raise

@@ -62,8 +62,8 @@ class TimescaleDBAdapter:
                 database=self._config.dbname,
                 user=self._config.user,
                 password=self._config.password,
-                command_timeout=120,
-                min_size=1,
+                command_timeout=300,
+                min_size=4,
                 max_size=32,
             )
             logger.debug(
@@ -363,18 +363,20 @@ def _build_records(
     Convert an Arrow table to a list of tuples for ``copy_records_to_table``.
 
     Timestamp columns are cast to microsecond-precision UTC datetimes via
-    PyArrow's vectorized C++ cast — ``to_pylist()`` on a
-    ``timestamp[us, UTC]`` array returns ``datetime`` objects directly,
-    eliminating the per-element Python loop.
+    PyArrow's vectorized C++ cast.  Uses a single ``to_pydict()`` call
+    instead of per-column ``to_pylist()`` for better allocation performance.
     """
-    col_arrays: list[list] = []
+    # Pre-cast timestamp columns in-place on the Arrow table (C++ level)
     for col_spec in schema.columns:
-        raw = table.column(col_spec.name)
         if col_spec.role == ColumnRole.TIMESTAMP:
-            col_arrays.append(
-                raw.cast(pa.timestamp("us", tz="UTC")).to_pylist()
+            idx = table.schema.get_field_index(col_spec.name)
+            table = table.set_column(
+                idx, col_spec.name,
+                table.column(col_spec.name).cast(pa.timestamp("us", tz="UTC")),
             )
-        else:
-            col_arrays.append(raw.to_pylist())
 
-    return list(zip(*col_arrays))
+    # Single C++ call to convert all columns at once — avoids repeated
+    # to_pylist() overhead and produces fewer intermediate Python objects.
+    d = table.to_pydict()
+    columns_ordered = [col_spec.name for col_spec in schema.columns]
+    return list(zip(*(d[name] for name in columns_ordered)))

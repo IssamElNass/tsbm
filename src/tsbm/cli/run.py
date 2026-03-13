@@ -558,8 +558,8 @@ async def _seed_one_adapter(
         _total_src = [1]
 
         # --- WAL backpressure (QuestDB only) ---
-        _WAL_LAG_THRESHOLD = 50  # pause when WAL lag exceeds this many txns
-        _WAL_LAG_POLL = 2.0  # seconds between WAL lag checks while paused
+        _WAL_LAG_THRESHOLD = 200  # pause when WAL lag exceeds this many txns
+        _WAL_LAG_POLL = 0.5  # seconds between WAL lag checks while paused
         _has_wal_check = hasattr(adapter, "get_wal_lag")
 
         async def _wait_for_wal() -> None:
@@ -579,6 +579,12 @@ async def _seed_one_adapter(
         # --- parallel worker infrastructure ---
         _SENTINEL = None  # signals workers to stop
 
+        # Per-file batch tracking for parallel file reading
+        _file_pending: dict[str, int] = {}          # source_key -> batches not yet consumed
+        _file_done_producing: dict[str, bool] = {}   # source_key -> producer finished reading
+        _file_events: dict[str, asyncio.Event] = {}  # source_key -> set when all batches consumed
+        _tracking_lock = asyncio.Lock()
+
         async def _worker(worker_adapter: Any) -> None:
             """Pull batches from the queue and ingest them."""
             nonlocal rows_ingested
@@ -587,7 +593,7 @@ async def _seed_one_adapter(
                 if item is _SENTINEL:
                     queue.task_done()
                     break
-                tbl = item
+                source_key, tbl = item
                 try:
                     result = await worker_adapter.ingest_batch(tbl, table_name)
                     rows_ingested += result.rows
@@ -604,6 +610,12 @@ async def _seed_one_adapter(
                         raise
                 finally:
                     queue.task_done()
+                    # Track per-file completion (only active for multi-source mode)
+                    if source_key in _file_pending:
+                        async with _tracking_lock:
+                            _file_pending[source_key] -= 1
+                            if _file_pending[source_key] == 0 and _file_done_producing.get(source_key):
+                                _file_events[source_key].set()
 
         # Create worker adapter clones (each gets its own connection + sender)
         worker_adapters: list[Any] = []
@@ -620,7 +632,7 @@ async def _seed_one_adapter(
         else:
             worker_adapters.append(adapter)
 
-        queue: asyncio.Queue[pa.Table | None] = asyncio.Queue(maxsize=n_workers * 2)
+        queue: asyncio.Queue[tuple[str, pa.Table] | None] = asyncio.Queue(maxsize=n_workers * 4)
 
         # Start worker tasks
         worker_tasks = [asyncio.create_task(_worker(wa)) for wa in worker_adapters]
@@ -628,54 +640,105 @@ async def _seed_one_adapter(
         try:
             if has_sources:
                 _total_src[0] = len(dataset.source_paths)
-                for src_idx, source in enumerate(dataset.source_paths):
+                pending_sources = [
+                    (src_idx, source)
+                    for src_idx, source in enumerate(dataset.source_paths)
+                    if str(source) not in completed_set
+                ]
+                _file_read_sem = asyncio.Semaphore(min(4, max(1, len(pending_sources))))
+
+                # Pre-initialize tracking for all pending files so the checkpoint
+                # coroutine can safely await events immediately.
+                for _si, _src in pending_sources:
+                    _sk = str(_src)
+                    _file_pending[_sk] = 0
+                    _file_done_producing[_sk] = False
+                    _file_events[_sk] = asyncio.Event()
+
+                async def _file_producer(src_idx: int, source: Any) -> None:
+                    """Read batches from one source file and push them to the queue."""
                     source_key = str(source)
-                    if source_key in completed_set:
-                        continue
-                    _current_src[0] = src_idx + 1
-                    _current_file[0] = Path(source_key).name if isinstance(source, Path) else source_key.rsplit("/", 1)[-1]
-                    if isinstance(source, Path):
-                        batches = _iter_dataset_batches(source, dataset.chunk_size)
-                    else:
-                        batches = _iter_azure_batches(
-                            source, dataset.chunk_size,
-                            getattr(dataset, "_azure_connection_string", ""),
-                            getattr(dataset, "_azure_sas_token", ""),
-                            getattr(dataset, "_azure_account_name", ""),
+
+                    async with _file_read_sem:
+                        if isinstance(source, Path):
+                            batches = _iter_dataset_batches(source, dataset.chunk_size)
+                        else:
+                            batches = _iter_azure_batches(
+                                source, dataset.chunk_size,
+                                getattr(dataset, "_azure_connection_string", ""),
+                                getattr(dataset, "_azure_sas_token", ""),
+                                getattr(dataset, "_azure_account_name", ""),
+                            )
+                        for batch in batches:
+                            tbl = pa.Table.from_batches([batch]) if not isinstance(batch, pa.Table) else batch
+                            await _wait_for_wal()
+                            async with _tracking_lock:
+                                _file_pending[source_key] += 1
+                            await queue.put((source_key, tbl))
+
+                    async with _tracking_lock:
+                        _file_done_producing[source_key] = True
+                        if _file_pending[source_key] == 0:
+                            _file_events[source_key].set()
+
+                async def _checkpoint_files() -> None:
+                    """Wait for each file's batches to be consumed, then checkpoint."""
+                    import pyarrow.parquet as _pq  # noqa: PLC0415
+                    _prev_rows = rows_ingested
+                    for src_idx, source in pending_sources:
+                        source_key = str(source)
+                        _current_src[0] = src_idx + 1
+                        _current_file[0] = Path(source_key).name if isinstance(source, Path) else source_key.rsplit("/", 1)[-1]
+                        await _file_events[source_key].wait()
+
+                        # Calculate rows contributed by this file
+                        file_rows = rows_ingested - _prev_rows
+                        _prev_rows = rows_ingested
+
+                        # Try to get parquet metadata row count for display
+                        pq_rows_str = ""
+                        if isinstance(source, Path) and source.suffix in (".parquet", ".parq"):
+                            try:
+                                pf = _pq.ParquetFile(source)
+                                pq_rows_str = f" [dim]({pf.metadata.num_rows:,} rows in file)[/dim]"
+                            except Exception:
+                                pass
+
+                        checkpoint = _load_checkpoint()
+                        ckpt = checkpoint.setdefault(adapter.name, {
+                            "table_name": table_name,
+                            "completed_sources": [],
+                            "rows_ingested": 0,
+                            "chunks_completed": 0,
+                        })
+                        ckpt["completed_sources"].append(source_key)
+                        ckpt["rows_ingested"] = rows_ingested
+                        _save_checkpoint(checkpoint)
+                        _display_src = _current_file[0] if isinstance(source, Path) else source_key
+                        console.print(
+                            f"  [green]done[/green] [cyan]{adapter.name}[/cyan] "
+                            f"file {src_idx + 1}/{_total_src[0]}: [bold]{_display_src}[/bold] "
+                            f"— {file_rows:,} rows{pq_rows_str}"
                         )
-                    for batch in batches:
-                        tbl = pa.Table.from_batches([batch]) if not isinstance(batch, pa.Table) else batch
-                        await _wait_for_wal()
-                        await queue.put(tbl)
 
-                    # Wait for all queued batches to finish before checkpointing
-                    await queue.join()
-
-                    checkpoint = _load_checkpoint()
-                    ckpt = checkpoint.setdefault(adapter.name, {
-                        "table_name": table_name,
-                        "completed_sources": [],
-                        "rows_ingested": 0,
-                        "chunks_completed": 0,
-                    })
-                    ckpt["completed_sources"].append(source_key)
-                    ckpt["rows_ingested"] = rows_ingested
-                    _save_checkpoint(checkpoint)
-                    _display_src = _current_file[0] if isinstance(source, Path) else source_key
-                    console.print(
-                        f"  [green]checkpoint[/green] [cyan]{adapter.name}[/cyan] "
-                        f"file {src_idx + 1}/{_total_src[0]}: [bold]{_display_src}[/bold] "
-                        f"({rows_ingested:,} rows total)"
-                    )
+                # Launch file producers concurrently + checkpoint coroutine
+                producer_tasks = [
+                    asyncio.create_task(_file_producer(src_idx, source))
+                    for src_idx, source in pending_sources
+                ]
+                checkpoint_task = asyncio.create_task(_checkpoint_files())
+                await asyncio.gather(*producer_tasks)
+                await checkpoint_task
             elif dataset.streaming:
                 _chunk_idx = 0
                 _skip_chunks = _resume_chunks if resuming_streaming else 0
+                _stream_key = "__streaming__"
                 for chunk in dataset.iter_batches():
                     _chunk_idx += 1
                     if _chunk_idx <= _skip_chunks:
                         continue
                     await _wait_for_wal()
-                    await queue.put(chunk)
+                    await queue.put((_stream_key, chunk))
 
                     # Checkpoint after each chunk is fully queued and processed
                     await queue.join()
@@ -695,7 +758,7 @@ async def _seed_one_adapter(
                     )
             else:
                 tbl = dataset.load()
-                await queue.put(tbl)
+                await queue.put(("__eager__", tbl))
 
             # Wait for remaining batches
             await queue.join()
@@ -760,7 +823,13 @@ async def _parallel_seed_adapters(
                     )
 
             try:
-                await _seed_one_adapter(adapter, dataset, on_progress=_on_progress, seed_workers=seed_workers)
+                # Per-adapter seed_workers override (e.g. QuestDB benefits from fewer workers)
+                from tsbm.config.settings import get_settings as _get_settings  # noqa: PLC0415
+                _db_cfg = getattr(_get_settings().databases, adapter.name, None)
+                _adapter_workers = getattr(_db_cfg, "seed_workers", 0) if _db_cfg else 0
+                _effective_workers = _adapter_workers if _adapter_workers > 0 else seed_workers
+
+                await _seed_one_adapter(adapter, dataset, on_progress=_on_progress, seed_workers=_effective_workers)
                 seeded_adapters.add(adapter.name)
                 progress.update(
                     tasks_map[adapter.name],
@@ -1011,18 +1080,19 @@ async def async_generate(
 
 
 async def async_seed(
-    config_path: Path | None,
-    dataset_path: Path | None,
+    db_names: list[str] | None = None,
+    config_path: Path | None = None,
+    dataset_path: Path | None = None,
     dataset_list: list[str] | None = None,
     timestamp_col: str | None = None,
     drop_first: bool = True,
     seed_workers: int = 0,
     verbose: bool = False,
 ) -> None:
-    """Seed QuestDB with the full dataset — no benchmarks.
+    """Seed one or more databases with the full dataset — no benchmarks.
 
     Uses the same parallel-worker + WAL-backpressure infrastructure as
-    ``tsbm run`` but targets only QuestDB and skips all benchmark workloads.
+    ``tsbm run`` but skips all benchmark workloads.
     Displays live rows/sec throughput.
     """
     import time as _time  # noqa: PLC0415
@@ -1120,127 +1190,170 @@ async def async_seed(
         + (f" [dim](streaming)[/dim]" if getattr(dataset, 'streaming', False) else "")
     )
 
-    # ── adapter (QuestDB only) ──────────────────────────────────────────
-    adapters = get_enabled_adapters(["questdb"])
+    # ── adapters ────────────────────────────────────────────────────────
+    adapters = get_enabled_adapters(db_names)
     if not adapters:
-        console.print("[red]QuestDB adapter not available. Check your config.[/red]")
+        console.print("[red]No adapters available. Check your config and --db flag.[/red]")
         return
-    adapter = adapters[0]
 
+    adapter_names = ", ".join(a.name for a in adapters)
     console.print(
-        f"[cyan]Seeding:[/cyan] [bold]{adapter.name}[/bold] "
+        f"[cyan]Seeding:[/cyan] [bold]{adapter_names}[/bold] "
         f"(workers={seed_workers}, WAL throttle enabled)"
     )
 
-    seed_start = _time.monotonic()
+    # ── per-file row counts (for parquet sources) ─────────────────────
+    import pyarrow.parquet as _pq  # noqa: PLC0415
+    file_row_counts: list[tuple[str, int]] = []
+    has_sources = bool(getattr(dataset, "source_paths", None))
+    if has_sources:
+        for src in dataset.source_paths:
+            if isinstance(src, Path) and src.suffix in (".parquet", ".parq"):
+                try:
+                    pf = _pq.ParquetFile(src)
+                    file_row_counts.append((src.name, pf.metadata.num_rows))
+                except Exception:
+                    file_row_counts.append((src.name, -1))
+            elif isinstance(src, Path):
+                file_row_counts.append((src.name, -1))
+    elif not getattr(dataset, "streaming", False):
+        # Single file — try to get row count from parquet metadata
+        eff_path = Path(effective_dataset) if effective_dataset else None
+        if eff_path and eff_path.suffix in (".parquet", ".parq"):
+            try:
+                pf = _pq.ParquetFile(eff_path)
+                file_row_counts.append((eff_path.name, pf.metadata.num_rows))
+            except Exception:
+                pass
 
-    seeded: set[str] = set()
+    for adapter in adapters:
+        seed_start = _time.monotonic()
+        seeded: set[str] = set()
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        tid = progress.add_task(f"[cyan]{adapter.name}[/cyan] [dim]starting…[/dim]", total=None)
+        console.print(f"\n[cyan]{'─' * 40}[/cyan]")
+        console.print(f"[cyan]Database:[/cyan] [bold]{adapter.name}[/bold]")
 
-        def _on_progress(rows: int, rate: float, src_idx: int, total_src: int, filename: str = "") -> None:
-            rate_str = _format_rate(rate)
-            if total_src > 1:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            tid = progress.add_task(f"[cyan]{adapter.name}[/cyan] [dim]starting…[/dim]", total=None)
+
+            def _on_progress(rows: int, rate: float, src_idx: int, total_src: int, filename: str = "", _adapter=adapter, _tid=tid) -> None:
+                rate_str = _format_rate(rate)
+                if total_src > 1:
+                    progress.update(
+                        _tid,
+                        description=(
+                            f"[cyan]{_adapter.name}[/cyan] "
+                            f"[dim]{rows:,} rows — {rate_str} — {filename} ({src_idx}/{total_src})[/dim]"
+                        ),
+                    )
+                else:
+                    progress.update(
+                        _tid,
+                        description=(
+                            f"[cyan]{_adapter.name}[/cyan] "
+                            f"[dim]{rows:,} rows — {rate_str}[/dim]"
+                        ),
+                    )
+
+            # Track per-callback rates for min/max/avg calculation
+            _rates: list[float] = []
+
+            def _on_progress_tracking(rows: int, rate: float, src_idx: int, total_src: int, filename: str = "") -> None:
+                if rate > 0:
+                    _rates.append(rate)
+                _on_progress(rows, rate, src_idx, total_src, filename)
+
+            try:
+                await _seed_one_adapter(
+                    adapter, dataset,
+                    on_progress=_on_progress_tracking,
+                    seed_workers=seed_workers,
+                )
+                seeded.add(adapter.name)
+                elapsed = _time.monotonic() - seed_start
+                final_count = await _get_final_count(adapter, dataset.schema.name)
+                overall_rate = final_count / elapsed if elapsed > 0 else 0
                 progress.update(
                     tid,
                     description=(
-                        f"[cyan]{adapter.name}[/cyan] "
-                        f"[dim]{rows:,} rows — {rate_str} — {filename} ({src_idx}/{total_src})[/dim]"
+                        f"[cyan]{adapter.name}[/cyan] [green]seeded[/green] "
+                        f"[dim]{final_count:,} rows in {elapsed:.1f}s — {_format_rate(overall_rate)}[/dim]"
                     ),
+                    completed=True,
                 )
+            except Exception as exc:
+                elapsed = _time.monotonic() - seed_start
+                final_count = 0
+                overall_rate = 0.0
+                logger.exception("Failed to seed %s", adapter.name)
+                console.print(f"[red][{adapter.name}] Seed error: {exc}[/red]")
+                progress.update(
+                    tid,
+                    description=f"[cyan]{adapter.name}[/cyan] [red]failed[/red]",
+                    completed=True,
+                )
+
+        if seeded:
+            # ── summary table ───────────────────────────────────────────
+            min_rate = min(_rates) if _rates else 0.0
+            max_rate = max(_rates) if _rates else 0.0
+            avg_rate = sum(_rates) / len(_rates) if _rates else 0.0
+
+            # Format elapsed into human-readable duration
+            mins, secs = divmod(elapsed, 60)
+            hrs, mins = divmod(int(mins), 60)
+            if hrs:
+                duration_str = f"{hrs}h {mins}m {secs:.1f}s"
+            elif mins:
+                duration_str = f"{int(mins)}m {secs:.1f}s"
             else:
-                progress.update(
-                    tid,
-                    description=(
-                        f"[cyan]{adapter.name}[/cyan] "
-                        f"[dim]{rows:,} rows — {rate_str}[/dim]"
-                    ),
-                )
+                duration_str = f"{secs:.1f}s"
 
-        # Track per-callback rates for min/max/avg calculation
-        _rates: list[float] = []
-
-        def _on_progress_tracking(rows: int, rate: float, src_idx: int, total_src: int, filename: str = "") -> None:
-            if rate > 0:
-                _rates.append(rate)
-            _on_progress(rows, rate, src_idx, total_src, filename)
-
-        try:
-            await _seed_one_adapter(
-                adapter, dataset,
-                on_progress=_on_progress_tracking,
-                seed_workers=seed_workers,
+            summary = Table(
+                title=f"seed summary — {adapter.name}",
+                title_style="bold green",
+                border_style="green",
+                show_header=False,
+                padding=(0, 2),
             )
-            seeded.add(adapter.name)
-            elapsed = _time.monotonic() - seed_start
-            final_count = await _get_final_count(adapter, dataset.schema.name)
-            overall_rate = final_count / elapsed if elapsed > 0 else 0
-            progress.update(
-                tid,
-                description=(
-                    f"[cyan]{adapter.name}[/cyan] [green]seeded[/green] "
-                    f"[dim]{final_count:,} rows in {elapsed:.1f}s — {_format_rate(overall_rate)}[/dim]"
-                ),
-                completed=True,
-            )
-        except Exception as exc:
-            elapsed = _time.monotonic() - seed_start
-            final_count = 0
-            overall_rate = 0.0
-            logger.exception("Failed to seed %s", adapter.name)
-            console.print(f"[red][{adapter.name}] Seed error: {exc}[/red]")
-            progress.update(
-                tid,
-                description=f"[cyan]{adapter.name}[/cyan] [red]failed[/red]",
-                completed=True,
-            )
+            summary.add_column("Metric", style="bold")
+            summary.add_column("Value", justify="right")
 
-    if seeded:
-        # ── summary table ───────────────────────────────────────────────
-        min_rate = min(_rates) if _rates else 0.0
-        max_rate = max(_rates) if _rates else 0.0
-        avg_rate = sum(_rates) / len(_rates) if _rates else 0.0
+            summary.add_row("Table", f"[bold]{dataset.schema.name}[/bold]")
+            summary.add_row("Total rows", f"[bold]{final_count:,}[/bold]")
+            summary.add_row("Duration", duration_str)
+            summary.add_row("Workers", str(seed_workers))
+            summary.add_row("", "")
+            summary.add_row("Avg rows/sec", f"[bold]{_format_rate(avg_rate)}[/bold]")
+            summary.add_row("Min rows/sec", _format_rate(min_rate))
+            summary.add_row("Max rows/sec", _format_rate(max_rate))
+            summary.add_row("Overall rows/sec", f"[bold green]{_format_rate(overall_rate)}[/bold green]")
 
-        # Format elapsed into human-readable duration
-        mins, secs = divmod(elapsed, 60)
-        hrs, mins = divmod(int(mins), 60)
-        if hrs:
-            duration_str = f"{hrs}h {mins}m {secs:.1f}s"
-        elif mins:
-            duration_str = f"{int(mins)}m {secs:.1f}s"
-        else:
-            duration_str = f"{secs:.1f}s"
+            console.print()
+            console.print(summary)
 
-        summary = Table(
-            title="seed summary",
-            title_style="bold green",
-            border_style="green",
-            show_header=False,
+    # ── per-file row counts (printed once after all adapters) ─────────
+    if file_row_counts:
+        file_table = Table(
+            title="files",
+            title_style="bold cyan",
+            border_style="cyan",
             padding=(0, 2),
         )
-        summary.add_column("Metric", style="bold")
-        summary.add_column("Value", justify="right")
-
-        summary.add_row("Table", f"[bold]{dataset.schema.name}[/bold]")
-        summary.add_row("Total rows", f"[bold]{final_count:,}[/bold]")
-        summary.add_row("Duration", duration_str)
-        summary.add_row("Workers", str(seed_workers))
-        summary.add_row("", "")
-        summary.add_row("Avg rows/sec", f"[bold]{_format_rate(avg_rate)}[/bold]")
-        summary.add_row("Min rows/sec", _format_rate(min_rate))
-        summary.add_row("Max rows/sec", _format_rate(max_rate))
-        summary.add_row("Overall rows/sec", f"[bold green]{_format_rate(overall_rate)}[/bold green]")
-
+        file_table.add_column("File", style="bold")
+        file_table.add_column("Rows", justify="right")
+        for fname, rc in file_row_counts:
+            rc_str = f"{rc:,}" if rc >= 0 else "[dim]unknown[/dim]"
+            file_table.add_row(fname, rc_str)
         console.print()
-        console.print(summary)
+        console.print(file_table)
 
 
 async def _get_final_count(adapter: Any, table_name: str) -> int:
