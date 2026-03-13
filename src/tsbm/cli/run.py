@@ -655,6 +655,16 @@ async def _seed_one_adapter(
                     _file_done_producing[_sk] = False
                     _file_events[_sk] = asyncio.Event()
 
+                # Set initial file info so the first _report() call has meaningful values
+                if pending_sources:
+                    _first_idx, _first_source = pending_sources[0]
+                    _current_src[0] = _first_idx + 1
+                    _current_file[0] = (
+                        Path(str(_first_source)).name
+                        if isinstance(_first_source, Path)
+                        else str(_first_source).rsplit("/", 1)[-1]
+                    )
+
                 async def _file_producer(src_idx: int, source: Any) -> None:
                     """Read batches from one source file and push them to the queue."""
                     source_key = str(source)
@@ -675,6 +685,7 @@ async def _seed_one_adapter(
                             async with _tracking_lock:
                                 _file_pending[source_key] += 1
                             await queue.put((source_key, tbl))
+                            await asyncio.sleep(0)  # yield so workers can report progress
 
                     async with _tracking_lock:
                         _file_done_producing[source_key] = True
