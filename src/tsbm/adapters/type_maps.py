@@ -118,6 +118,7 @@ def arrow_table_to_ddl(
     db: str,
     table_name: str,
     partition_by: str = "DAY",
+    index_symbols: bool = True,
 ) -> str:
     """
     Generate a ``CREATE TABLE`` statement for *db* from *schema*.
@@ -134,7 +135,7 @@ def arrow_table_to_ddl(
 
     The statement uses ``CREATE TABLE IF NOT EXISTS`` for idempotency.
     """
-    col_defs = _column_definitions(schema, db)
+    col_defs = _column_definitions(schema, db, index_symbols=index_symbols)
 
     if db == DB_QUESTDB:
         pb = partition_by.upper()
@@ -152,7 +153,7 @@ def arrow_table_to_ddl(
     raise ValueError(f"Unknown database: {db!r}")
 
 
-def _column_definitions(schema: DatasetSchema, db: str) -> list[str]:
+def _column_definitions(schema: DatasetSchema, db: str, index_symbols: bool = True) -> list[str]:
     """Return a list of ``"col_name TYPE [NOT NULL]"`` strings."""
     defs = []
     for col in schema.columns:
@@ -165,7 +166,11 @@ def _column_definitions(schema: DatasetSchema, db: str) -> list[str]:
             # TimescaleDB requires the primary timestamp to be NOT NULL
             if col.name == schema.timestamp_col and db == DB_TIMESCALEDB:
                 null_clause = " NOT NULL"
-        defs.append(f"    {_quote(col.name, db)} {sql_type}{null_clause}")
+        # QuestDB: add INDEX on SYMBOL columns for fast WHERE filtering
+        if db == DB_QUESTDB and index_symbols and col.role == ColumnRole.TAG:
+            defs.append(f"    {_quote(col.name, db)} {sql_type} INDEX{null_clause}")
+        else:
+            defs.append(f"    {_quote(col.name, db)} {sql_type}{null_clause}")
     return defs
 
 

@@ -80,7 +80,7 @@ class QuestDBAdapter:
                 user="admin",
                 password="quest",
                 statement_cache_size=0,  # QuestDB PGWire has partial PS support
-                command_timeout=60,
+                command_timeout=300,
                 min_size=1,
                 max_size=32,
             )
@@ -125,10 +125,21 @@ class QuestDBAdapter:
         # QuestDB's CREATE TABLE doesn't support IF NOT EXISTS — use WAL mode
         # Drop first to guarantee a clean state
         await self.drop_table(schema.name)
-        ddl = arrow_table_to_ddl(schema, DB_QUESTDB, schema.name, self._config.partition_by)
+        ddl = arrow_table_to_ddl(
+            schema, DB_QUESTDB, schema.name,
+            partition_by=self._config.partition_by,
+            index_symbols=self._config.index_symbols,
+        )
         logger.debug("QuestDB DDL:\n%s", ddl)
         try:
             await self._pool.execute(ddl)  # type: ignore[union-attr]
+            # Per-table WAL tuning for large-scale ingestion (8B+ rows)
+            await self._pool.execute(  # type: ignore[union-attr]
+                f'ALTER TABLE "{schema.name}" SET PARAM maxUncommittedRows = 2000000'
+            )
+            await self._pool.execute(  # type: ignore[union-attr]
+                f'ALTER TABLE "{schema.name}" SET PARAM o3MaxLag = 60s'
+            )
         except Exception as exc:
             raise QueryError(f"QuestDB create_table failed: {exc}") from exc
 
@@ -176,14 +187,15 @@ class QuestDBAdapter:
         schema = self._schema
         conf_str = (
             f"http::addr={self._config.host}:{self._config.ilp_port};"
-            f"auto_flush_rows=100000;auto_flush_interval=off;"
+            f"auto_flush_rows=150000;auto_flush_interval=off;"
+            f"init_buf_size=4194304;"
         )
         symbols = [c.name for c in schema.columns if c.role == ColumnRole.TAG]
         ts_col = schema.timestamp_col
         n_rows = len(table)
         n_bytes = estimate_table_bytes(table)
 
-        _PANDAS_CHUNK = 500_000  # rows per pandas conversion
+        _PANDAS_CHUNK = 1_000_000  # rows per pandas conversion
 
         def _sync_send() -> TimingResult:
             import pyarrow.compute as pc  # noqa: PLC0415

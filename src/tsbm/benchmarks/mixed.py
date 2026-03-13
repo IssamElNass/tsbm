@@ -258,14 +258,18 @@ class MixedBenchmark:
         if not windows:
             return []
 
+        # Use the smallest configured row limit to keep mixed queries fast.
+        row_limits = getattr(config, "query_row_limits", None) or [0]
+        row_limit = min(row_limits) if row_limits else 0
+
         pool: list[tuple[str, tuple]] = []
         pool.extend(
-            TimeRangeBenchmark()._make_queries(schema, adapter_name, windows, config)
+            TimeRangeBenchmark()._make_queries(schema, adapter_name, windows, config, row_limit=row_limit)
         )
         pool.extend(
-            AggregationBenchmark()._make_queries(schema, adapter_name, windows, config)
+            AggregationBenchmark()._make_queries(schema, adapter_name, windows, config, row_limit=row_limit)
         )
         pool.extend(
-            LastPointBenchmark()._make_queries(schema, adapter_name, windows, config)
+            LastPointBenchmark()._make_queries(schema, adapter_name, windows, config, row_limit=row_limit)
         )
         return pool

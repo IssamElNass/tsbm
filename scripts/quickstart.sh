@@ -63,6 +63,18 @@ else
 fi
 echo ""
 
+# ── Step 1.5: Prepare VM for performance profile ────────────────────────────
+if [ "$COMPOSE_FILE" = "docker/docker-compose.performance.yml" ]; then
+    echo "→ Setting up VM for performance profile..."
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ "$(id -u)" -eq 0 ]; then
+        bash "${SCRIPT_DIR}/setup-perf-vm.sh"
+    else
+        sudo bash "${SCRIPT_DIR}/setup-perf-vm.sh"
+    fi
+    echo ""
+fi
+
 # ── Step 2: Start databases ──────────────────────────────────────────────────
 echo "→ Step 2/5: Starting databases..."
 docker compose -f "$COMPOSE_FILE" up -d

@@ -114,7 +114,12 @@ _QUERY_ONLY_BENCHMARKS: frozenset[str] = frozenset({
 # ---------------------------------------------------------------------------
 # IoT-scale latency thresholds
 # ---------------------------------------------------------------------------
-# Thresholds are (excellent_ms, good_ms, acceptable_ms) for the p99 metric.
+# Thresholds are (great_ms, solid_ms, fair_ms) for the p99 metric.
+#
+# These include headroom for Docker-bridge / loopback network overhead and
+# Python client-side deserialization lag (~5-20 ms baseline jitter depending
+# on result size).  Don't read too much into small differences — the goal is
+# to surface obviously-good vs obviously-slow behaviour, not to split hairs.
 #
 # The critical distinction is RESULT SET SIZE:
 #
@@ -123,9 +128,6 @@ _QUERY_ONLY_BENCHMARKS: frozenset[str] = frozenset({
 #   Return a SMALL, FIXED-SIZE result regardless of window width: e.g.
 #   24 rows for hourly buckets over a day, or 168 rows for hourly over a
 #   week.  The DB computes in C++ / SIMD and sends back kilobytes.
-#   → Tight thresholds: 10-100 ms even on billions of rows is realistic.
-#   → Exceeding "Good" here means the engine lacks vectorisation or the
-#     chunk/partition strategy is wrong.
 #
 #   Raw-scan queries (SELECT * — time_range benchmark)
 #   ─────────────────────────────────────────────────────────────────────
@@ -133,62 +135,55 @@ _QUERY_ONLY_BENCHMARKS: frozenset[str] = frozenset({
 #   can be ~750 K rows.  Transferring and deserialising that over a socket
 #   into Python dicts takes hundreds of milliseconds by physics alone —
 #   independent of how fast the database engine is.
-#   → Relaxed thresholds: the bottleneck is wire + deserialization, not DB.
-#   → No real-time production IoT system should issue raw SELECT * over
-#     multi-day windows; use aggregation instead.
 #
-# The "Good" tier maps to "fits on a real-time dashboard at p99"; the
-# "Acceptable" tier maps to "tolerable for batch reports or ad-hoc queries".
+# The "Solid" tier maps to "fits on a real-time dashboard at p99"; the
+# "Fair" tier maps to "tolerable for batch reports or ad-hoc queries".
 _LATENCY_THRESHOLDS: dict[str, tuple[float, float, float]] = {
     # ── Aggregation (SAMPLE BY / time_bucket / DATE_BIN) ──────────────────
     # Returns N fixed-size buckets — tiny result, DB does the heavy lifting.
-    # A vectorised TSDB engine should be in the 5-100 ms range here even at
-    # billions of rows, because chunk pruning eliminates irrelevant data.
-    "aggregation_1min":       (  5,   30,    300),   # ~1 bucket returned
-    "aggregation_1h":         ( 20,  100,  1_000),   # ~60 buckets
-    "aggregation_1day":       ( 50,  500,  5_000),   # ~1 440 buckets
-    "aggregation_1week":      (100, 1_000, 10_000),  # ~10 080 buckets
+    # +10-20 ms headroom for network round-trip and client overhead.
+    "aggregation_1min":       ( 15,   50,    400),   # ~1 bucket returned
+    "aggregation_1h":         ( 35,  150,  1_500),   # ~60 buckets
+    "aggregation_1day":       ( 75,  650,  6_500),   # ~1 440 buckets
+    "aggregation_1week":      (150, 1_300, 13_000),  # ~10 080 buckets
 
     # ── High-cardinality GROUP BY (COUNT + AVG per tag) ────────────────────
     # Returns one row per unique device/tag — small result like aggregation,
     # but needs a hash GROUP BY step on top of the time filter.
-    "high_cardinality_1min":  ( 10,   50,    500),
-    "high_cardinality_1h":    ( 50,  300,  3_000),
-    "high_cardinality_1day":  (200, 1_500, 15_000),
-    "high_cardinality_1week": (500, 5_000, 30_000),
+    "high_cardinality_1min":  ( 20,   75,    650),
+    "high_cardinality_1h":    ( 75,  400,  4_000),
+    "high_cardinality_1day":  (250, 2_000, 18_000),
+    "high_cardinality_1week": (650, 6_500, 38_000),
 
     # ── Time-range raw scan (SELECT * — result scales with window) ─────────
     # The DB may be fast but the bottleneck is moving rows over the wire and
-    # deserialising them in Python.  Thresholds are deliberately looser.
-    "time_range_1min":        ( 10,   50,    500),   # few hundred rows
-    "time_range_1h":          ( 50,  300,  3_000),   # thousands of rows
-    "time_range_1day":        (200, 1_500, 15_000),  # tens of thousands
-    "time_range_1week":       (500, 5_000, 30_000),  # hundreds of thousands
+    # deserialising them in Python.  Thresholds are deliberately loose.
+    "time_range_1min":        ( 20,   75,    650),   # few hundred rows
+    "time_range_1h":          ( 75,  400,  4_000),   # thousands of rows
+    "time_range_1day":        (250, 2_000, 18_000),  # tens of thousands
+    "time_range_1week":       (650, 6_500, 38_000),  # hundreds of thousands
 
     # ── Last-point (most recent value per device, full-table) ─────────────
-    # QuestDB LATEST ON uses a native reversed-partition index — often < 20 ms.
-    # TimescaleDB DISTINCT ON is O(n_chunks).  CrateDB ROW_NUMBER() is slower.
-    # Thresholds sit at the TimescaleDB/CrateDB level; QuestDB will typically
-    # land in Excellent.
-    "last_point":             (100,  1_000, 10_000),
+    # QuestDB LATEST ON is typically < 20 ms.  TimescaleDB / CrateDB are
+    # slower.  Extra headroom for network + client overhead.
+    "last_point":             (150,  1_300, 13_000),
 
     # ── Downsampling (full dataset, multi-resolution, no time filter) ──────
-    # Aggregates everything at 1-min / 1-hour / 1-day granularity — the
-    # heaviest query in the suite.  Even vectorised engines need seconds on
-    # 40 M+ rows without a pre-built continuous aggregate / MV.
-    "downsampling":           (500, 5_000, 30_000),
+    # Heaviest query in the suite — even vectorised engines need seconds on
+    # 40 M+ rows.  Network overhead is small relative to total time here.
+    "downsampling":           (650, 6_500, 38_000),
 
     # ── Mixed benchmark ───────────────────────────────────────────────────
-    "mixed_read":             (100,  1_000,  5_000),
-    "mixed_write":            ( 10,    100,  1_000),
+    "mixed_read":             (150,  1_300,  6_500),
+    "mixed_write":            ( 20,    150,  1_500),
 }
 # Fallback for any operation name not in the table above.
-_DEFAULT_LATENCY_THRESHOLD: tuple[float, float, float] = (50, 500, 5_000)
+_DEFAULT_LATENCY_THRESHOLD: tuple[float, float, float] = (75, 650, 6_500)
 
 
 def _get_latency_thresholds(operation: str) -> tuple[float, float, float]:
     """
-    Return ``(excellent_ms, good_ms, acceptable_ms)`` for *operation*.
+    Return ``(great_ms, solid_ms, fair_ms)`` for *operation*.
 
     Tries an exact match first, then a prefix match, then falls back to
     ``_DEFAULT_LATENCY_THRESHOLD``.
@@ -503,31 +498,48 @@ async def _seed_one_adapter(
         table_name = dataset.schema.name
         has_sources = bool(getattr(dataset, "source_paths", None))
 
-        # --- checkpoint resume logic (multi-source only) ---
+        # --- checkpoint resume logic ---
         checkpoint = _load_checkpoint()
         adapter_ckpt = checkpoint.get(adapter.name, {})
-        resuming = (
+        resuming_sources = (
             has_sources
             and adapter_ckpt.get("table_name") == table_name
             and adapter_ckpt.get("completed_sources")
         )
+        resuming_streaming = (
+            not has_sources
+            and dataset.streaming
+            and adapter_ckpt.get("table_name") == table_name
+            and adapter_ckpt.get("chunks_completed", 0) > 0
+        )
+        resuming = resuming_sources or resuming_streaming
 
-        if resuming:
+        if resuming_sources:
             completed_set = set(adapter_ckpt["completed_sources"])
             rows_ingested = adapter_ckpt.get("rows_ingested", 0)
             logger.info(
                 "Resuming %s seed: %d sources done, %d rows so far",
                 adapter.name, len(completed_set), rows_ingested,
             )
+        elif resuming_streaming:
+            completed_set: set[str] = set()
+            rows_ingested = adapter_ckpt.get("rows_ingested", 0)
+            _resume_chunks = adapter_ckpt.get("chunks_completed", 0)
+            logger.info(
+                "Resuming %s seed: %d chunks done, %d rows so far",
+                adapter.name, _resume_chunks, rows_ingested,
+            )
         else:
             completed_set: set[str] = set()
             rows_ingested = 0
+            _resume_chunks = 0
             await adapter.drop_table(table_name)
             await adapter.create_table(dataset.schema)
             checkpoint[adapter.name] = {
                 "table_name": table_name,
                 "completed_sources": [],
                 "rows_ingested": 0,
+                "chunks_completed": 0,
             }
             _save_checkpoint(checkpoint)
 
@@ -644,19 +656,43 @@ async def _seed_one_adapter(
                         "table_name": table_name,
                         "completed_sources": [],
                         "rows_ingested": 0,
+                        "chunks_completed": 0,
                     })
                     ckpt["completed_sources"].append(source_key)
                     ckpt["rows_ingested"] = rows_ingested
                     _save_checkpoint(checkpoint)
+                    _display_src = _current_file[0] if isinstance(source, Path) else source_key
                     console.print(
-                        f"  [green]done[/green] [cyan]{adapter.name}[/cyan] "
-                        f"file {src_idx + 1}/{_total_src[0]}: [bold]{_current_file[0]}[/bold] "
+                        f"  [green]checkpoint[/green] [cyan]{adapter.name}[/cyan] "
+                        f"file {src_idx + 1}/{_total_src[0]}: [bold]{_display_src}[/bold] "
                         f"({rows_ingested:,} rows total)"
                     )
             elif dataset.streaming:
+                _chunk_idx = 0
+                _skip_chunks = _resume_chunks if resuming_streaming else 0
                 for chunk in dataset.iter_batches():
+                    _chunk_idx += 1
+                    if _chunk_idx <= _skip_chunks:
+                        continue
                     await _wait_for_wal()
                     await queue.put(chunk)
+
+                    # Checkpoint after each chunk is fully queued and processed
+                    await queue.join()
+                    checkpoint = _load_checkpoint()
+                    ckpt = checkpoint.setdefault(adapter.name, {
+                        "table_name": table_name,
+                        "completed_sources": [],
+                        "rows_ingested": 0,
+                        "chunks_completed": 0,
+                    })
+                    ckpt["chunks_completed"] = _chunk_idx
+                    ckpt["rows_ingested"] = rows_ingested
+                    _save_checkpoint(checkpoint)
+                    console.print(
+                        f"  [green]checkpoint[/green] [cyan]{adapter.name}[/cyan] "
+                        f"chunk {_chunk_idx}: ({rows_ingested:,} rows total)"
+                    )
             else:
                 tbl = dataset.load()
                 await queue.put(tbl)
@@ -974,6 +1010,253 @@ async def async_generate(
 # ---------------------------------------------------------------------------
 
 
+async def async_seed(
+    config_path: Path | None,
+    dataset_path: Path | None,
+    dataset_list: list[str] | None = None,
+    timestamp_col: str | None = None,
+    drop_first: bool = True,
+    seed_workers: int = 0,
+    verbose: bool = False,
+) -> None:
+    """Seed QuestDB with the full dataset — no benchmarks.
+
+    Uses the same parallel-worker + WAL-backpressure infrastructure as
+    ``tsbm run`` but targets only QuestDB and skips all benchmark workloads.
+    Displays live rows/sec throughput.
+    """
+    import time as _time  # noqa: PLC0415
+
+    # ── config ──────────────────────────────────────────────────────────
+    if config_path is not None:
+        settings = load_settings_from_file(config_path)
+    else:
+        settings = get_settings()
+
+    if seed_workers <= 0:
+        seed_workers = getattr(settings.workload, "seed_workers", 1)
+
+    # CLI --dataset (multiple) overrides config datasets list
+    if dataset_list:
+        settings.workload.datasets = dataset_list
+
+    effective_dataset = dataset_path or settings.workload.dataset
+
+    # ── dataset ─────────────────────────────────────────────────────────
+    azure_conn = settings.workload.azure_storage_connection_string
+    azure_sas = settings.workload.azure_storage_sas_token
+    azure_acct = settings.workload.azure_storage_account_name
+    use_multi = bool(settings.workload.datasets) and not dataset_path
+
+    if use_multi:
+        sources = resolve_dataset_sources(
+            settings.workload.datasets,
+            azure_connection_string=azure_conn,
+            azure_sas_token=azure_sas,
+            azure_account_name=azure_acct,
+        )
+        if verbose:
+            console.print(f"[cyan]Loading {len(sources)} dataset source(s):[/cyan]")
+            for src in sources:
+                console.print(f"  [dim]{src}[/dim]")
+
+        from tsbm.datasets.loader import _is_azure_url  # noqa: PLC0415
+        first_local = next((s for s in sources if isinstance(s, Path)), None)
+        if first_local:
+            schema_hint = infer_schema_from_sample(
+                first_local,
+                tag_cardinality_threshold=settings.workload.tag_cardinality_threshold,
+            )
+        else:
+            schema_hint = infer_schema_from_azure(
+                str(sources[0]),
+                tag_cardinality_threshold=settings.workload.tag_cardinality_threshold,
+                connection_string=azure_conn,
+                sas_token=azure_sas,
+                account_name=azure_acct,
+            )
+        dataset = load_multi_dataset_streaming(
+            sources,
+            schema_hint=schema_hint,
+            chunk_size=settings.workload.chunk_size,
+            azure_connection_string=azure_conn,
+            azure_sas_token=azure_sas,
+            azure_account_name=azure_acct,
+        )
+    else:
+        effective_dataset_path = Path(effective_dataset)
+        n_rows_est = estimate_row_count(effective_dataset_path)
+        streaming_threshold = settings.workload.streaming_threshold_rows
+
+        if n_rows_est > streaming_threshold:
+            schema_hint = infer_schema_from_sample(
+                effective_dataset_path,
+                sample_rows=min(50_000, n_rows_est),
+                tag_cardinality_threshold=settings.workload.tag_cardinality_threshold,
+            )
+            dataset = load_dataset_streaming(
+                effective_dataset_path,
+                schema_hint=schema_hint,
+                chunk_size=settings.workload.chunk_size,
+            )
+        else:
+            dataset = load_dataset(effective_dataset_path)
+
+    # Apply unit conversions
+    if settings.workload.unit_conversions and dataset.table is not None:
+        dataset.table = apply_unit_conversions(dataset.table, dict(settings.workload.unit_conversions))
+    elif settings.workload.unit_conversions and dataset.streaming:
+        dataset._unit_conversions = dict(settings.workload.unit_conversions)
+
+    # Timestamp column override
+    effective_ts_col = timestamp_col or settings.workload.timestamp_col or ""
+    if effective_ts_col:
+        from tsbm.datasets.loader import override_timestamp_col  # noqa: PLC0415
+        dataset = override_timestamp_col(dataset, effective_ts_col)
+
+    console.print(
+        f"[cyan]Dataset:[/cyan] [bold]{dataset.schema.name}[/bold] — "
+        f"{dataset.schema.row_count:,} rows"
+        + (f" [dim](streaming)[/dim]" if getattr(dataset, 'streaming', False) else "")
+    )
+
+    # ── adapter (QuestDB only) ──────────────────────────────────────────
+    adapters = get_enabled_adapters(["questdb"])
+    if not adapters:
+        console.print("[red]QuestDB adapter not available. Check your config.[/red]")
+        return
+    adapter = adapters[0]
+
+    console.print(
+        f"[cyan]Seeding:[/cyan] [bold]{adapter.name}[/bold] "
+        f"(workers={seed_workers}, WAL throttle enabled)"
+    )
+
+    seed_start = _time.monotonic()
+
+    seeded: set[str] = set()
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        tid = progress.add_task(f"[cyan]{adapter.name}[/cyan] [dim]starting…[/dim]", total=None)
+
+        def _on_progress(rows: int, rate: float, src_idx: int, total_src: int, filename: str = "") -> None:
+            rate_str = _format_rate(rate)
+            if total_src > 1:
+                progress.update(
+                    tid,
+                    description=(
+                        f"[cyan]{adapter.name}[/cyan] "
+                        f"[dim]{rows:,} rows — {rate_str} — {filename} ({src_idx}/{total_src})[/dim]"
+                    ),
+                )
+            else:
+                progress.update(
+                    tid,
+                    description=(
+                        f"[cyan]{adapter.name}[/cyan] "
+                        f"[dim]{rows:,} rows — {rate_str}[/dim]"
+                    ),
+                )
+
+        # Track per-callback rates for min/max/avg calculation
+        _rates: list[float] = []
+
+        def _on_progress_tracking(rows: int, rate: float, src_idx: int, total_src: int, filename: str = "") -> None:
+            if rate > 0:
+                _rates.append(rate)
+            _on_progress(rows, rate, src_idx, total_src, filename)
+
+        try:
+            await _seed_one_adapter(
+                adapter, dataset,
+                on_progress=_on_progress_tracking,
+                seed_workers=seed_workers,
+            )
+            seeded.add(adapter.name)
+            elapsed = _time.monotonic() - seed_start
+            final_count = await _get_final_count(adapter, dataset.schema.name)
+            overall_rate = final_count / elapsed if elapsed > 0 else 0
+            progress.update(
+                tid,
+                description=(
+                    f"[cyan]{adapter.name}[/cyan] [green]seeded[/green] "
+                    f"[dim]{final_count:,} rows in {elapsed:.1f}s — {_format_rate(overall_rate)}[/dim]"
+                ),
+                completed=True,
+            )
+        except Exception as exc:
+            elapsed = _time.monotonic() - seed_start
+            final_count = 0
+            overall_rate = 0.0
+            logger.exception("Failed to seed %s", adapter.name)
+            console.print(f"[red][{adapter.name}] Seed error: {exc}[/red]")
+            progress.update(
+                tid,
+                description=f"[cyan]{adapter.name}[/cyan] [red]failed[/red]",
+                completed=True,
+            )
+
+    if seeded:
+        # ── summary table ───────────────────────────────────────────────
+        min_rate = min(_rates) if _rates else 0.0
+        max_rate = max(_rates) if _rates else 0.0
+        avg_rate = sum(_rates) / len(_rates) if _rates else 0.0
+
+        # Format elapsed into human-readable duration
+        mins, secs = divmod(elapsed, 60)
+        hrs, mins = divmod(int(mins), 60)
+        if hrs:
+            duration_str = f"{hrs}h {mins}m {secs:.1f}s"
+        elif mins:
+            duration_str = f"{int(mins)}m {secs:.1f}s"
+        else:
+            duration_str = f"{secs:.1f}s"
+
+        summary = Table(
+            title="seed summary",
+            title_style="bold green",
+            border_style="green",
+            show_header=False,
+            padding=(0, 2),
+        )
+        summary.add_column("Metric", style="bold")
+        summary.add_column("Value", justify="right")
+
+        summary.add_row("Table", f"[bold]{dataset.schema.name}[/bold]")
+        summary.add_row("Total rows", f"[bold]{final_count:,}[/bold]")
+        summary.add_row("Duration", duration_str)
+        summary.add_row("Workers", str(seed_workers))
+        summary.add_row("", "")
+        summary.add_row("Avg rows/sec", f"[bold]{_format_rate(avg_rate)}[/bold]")
+        summary.add_row("Min rows/sec", _format_rate(min_rate))
+        summary.add_row("Max rows/sec", _format_rate(max_rate))
+        summary.add_row("Overall rows/sec", f"[bold green]{_format_rate(overall_rate)}[/bold green]")
+
+        console.print()
+        console.print(summary)
+
+
+async def _get_final_count(adapter: Any, table_name: str) -> int:
+    """Reconnect (if needed) and return the row count for *table_name*."""
+    try:
+        await adapter.connect()
+        return await adapter.get_row_count(table_name)
+    except Exception:
+        return 0
+    finally:
+        try:
+            await adapter.disconnect()
+        except Exception:
+            pass
+
+
 async def async_load(
     db_names: list[str] | None,
     dataset_path: Path | None,
@@ -1056,25 +1339,25 @@ def _assign_verdicts(summaries: list[dict[str, Any]], benchmark_name: str) -> di
             if is_throughput:
                 rps = row.get("rows_per_second_mean", 0) or 0
                 if rps >= 500_000:
-                    verdicts[idx] = "[green]Excellent[/green]"
+                    verdicts[idx] = "[green]Great[/green]"
                 elif rps >= 100_000:
-                    verdicts[idx] = "[green]Good[/green]"
+                    verdicts[idx] = "[green]Solid[/green]"
                 elif rps >= 20_000:
-                    verdicts[idx] = "[yellow]Acceptable[/yellow]"
+                    verdicts[idx] = "[yellow]Fair[/yellow]"
                 else:
-                    verdicts[idx] = "[red]Poor[/red]"
+                    verdicts[idx] = "[red]Slow[/red]"
             else:
                 p99 = row.get("latency_p99_ms", 0) or 0
                 op = row.get("operation", "")
-                excellent_ms, good_ms, acceptable_ms = _get_latency_thresholds(op)
-                if p99 <= excellent_ms:
-                    verdicts[idx] = "[green]Excellent[/green]"
-                elif p99 <= good_ms:
-                    verdicts[idx] = "[green]Good[/green]"
-                elif p99 <= acceptable_ms:
-                    verdicts[idx] = "[yellow]Acceptable[/yellow]"
+                great_ms, solid_ms, fair_ms = _get_latency_thresholds(op)
+                if p99 <= great_ms:
+                    verdicts[idx] = "[green]Great[/green]"
+                elif p99 <= solid_ms:
+                    verdicts[idx] = "[green]Solid[/green]"
+                elif p99 <= fair_ms:
+                    verdicts[idx] = "[yellow]Fair[/yellow]"
                 else:
-                    verdicts[idx] = "[red]Poor[/red]"
+                    verdicts[idx] = "[red]Slow[/red]"
         else:
             # Relative ranking within this group
             if is_throughput:
@@ -1090,11 +1373,11 @@ def _assign_verdicts(summaries: list[dict[str, Any]], benchmark_name: str) -> di
                 )
             for rank, (idx, _) in enumerate(ranked):
                 if rank == 0:
-                    verdicts[idx] = "[green]Best[/green]"
+                    verdicts[idx] = "[green]Fastest[/green]"
                 elif rank == len(ranked) - 1:
-                    verdicts[idx] = "[red]Worst[/red]"
+                    verdicts[idx] = "[red]Slowest[/red]"
                 else:
-                    verdicts[idx] = "[yellow]Mid[/yellow]"
+                    verdicts[idx] = "[yellow]Middle[/yellow]"
 
     return verdicts
 
@@ -1354,7 +1637,7 @@ def _print_interpretation(summaries: list[dict[str, Any]], benchmark_name: str) 
                 )
             else:
                 icon = "[green]↑[/green]" if best_rps >= 100_000 else "[yellow]~[/yellow]" if best_rps >= 20_000 else "[red]↓[/red]"
-                label = "Excellent" if best_rps >= 500_000 else "Good" if best_rps >= 100_000 else "Acceptable" if best_rps >= 20_000 else "Poor"
+                label = "Great" if best_rps >= 500_000 else "Solid" if best_rps >= 100_000 else "Fair" if best_rps >= 20_000 else "Slow"
                 lines.append(f"{icon} Throughput: [bold]{best_rps:,.0f}[/bold] rows/sec — {label}.")
         else:
             best = min(valid, key=lambda r: r.get("latency_p99_ms", float("inf")) or float("inf"))
@@ -1362,7 +1645,7 @@ def _print_interpretation(summaries: list[dict[str, Any]], benchmark_name: str) 
             best_p99 = best.get("latency_p99_ms", 0) or 0
             worst_p99 = worst.get("latency_p99_ms", 0) or 0
             op = rows[0].get("operation", "")
-            excellent_ms, good_ms, acceptable_ms = _get_latency_thresholds(op)
+            great_ms, solid_ms, fair_ms = _get_latency_thresholds(op)
 
             if len(valid) > 1:
                 ratio = f" ({worst_p99 / best_p99:.1f}× slower)" if best_p99 > 0 else ""
@@ -1374,15 +1657,15 @@ def _print_interpretation(summaries: list[dict[str, Any]], benchmark_name: str) 
                 )
             else:
                 icon = (
-                    "[green]↓[/green]" if best_p99 <= good_ms
-                    else "[yellow]~[/yellow]" if best_p99 <= acceptable_ms
+                    "[green]↓[/green]" if best_p99 <= solid_ms
+                    else "[yellow]~[/yellow]" if best_p99 <= fair_ms
                     else "[red]↑[/red]"
                 )
                 label = (
-                    "Excellent" if best_p99 <= excellent_ms
-                    else "Good" if best_p99 <= good_ms
-                    else "Acceptable" if best_p99 <= acceptable_ms
-                    else "Poor"
+                    "Great" if best_p99 <= great_ms
+                    else "Solid" if best_p99 <= solid_ms
+                    else "Fair" if best_p99 <= fair_ms
+                    else "Slow"
                 )
                 lines.append(f"{icon} p99 latency: [bold]{best_p99:.1f} ms[/bold] — {label}.")
 

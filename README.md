@@ -27,6 +27,7 @@ Handles datasets from **100 K to 100 M+ rows**. Large files are read and ingeste
   - [\[monitor\]](#monitor)
   - [Environment Variable Overrides](#environment-variable-overrides)
 - [CLI Reference](#cli-reference)
+  - [tsbm seed](#tsbm-seed)
 - [Results & Comparison](#results--comparison)
 - [Architecture](#architecture)
 - [Development](#development)
@@ -628,6 +629,39 @@ Options:
 
 ---
 
+### `tsbm seed`
+
+Seeds QuestDB with the full dataset without running any benchmarks. Uses parallel ingest workers and automatically throttles when QuestDB's WAL lag gets too high. Displays live rows/sec throughput.
+
+```
+tsbm seed [OPTIONS]
+
+Options:
+  --config / -c    PATH  benchmark.toml path.
+  --dataset        TEXT  Override dataset path(s). Repeat for multiple files.
+                         Supports globs and az:// URLs.
+  --timestamp-col  TEXT  Name of the timestamp column (overrides auto-detection).
+  --drop / --no-drop     Drop existing table before seeding. Default: --drop.
+  --workers / -w   INT   Number of parallel ingest workers. 0 = use config value.
+                         Default: 0.
+  --verbose / -v         Enable DEBUG-level logging.
+```
+
+**Examples:**
+
+```bash
+# Seed using the dataset from benchmark.toml
+tsbm seed
+
+# Seed with a specific dataset and 8 workers
+tsbm seed --dataset datasets/11m.parquet --workers 8
+
+# Append into an existing table (no drop)
+tsbm seed --no-drop --dataset datasets/extra.parquet
+```
+
+---
+
 ### `tsbm compare`
 
 ```
@@ -814,7 +848,7 @@ src/tsbm/
 │   └── app.py              # Streamlit interactive results viewer
 └── cli/
     ├── main.py             # Typer app + command definitions
-    ├── run.py              # Benchmark orchestration (run, generate, load)
+    ├── run.py              # Benchmark orchestration (run, generate, load, seed)
     ├── compare.py          # tsbm compare command
     ├── report.py           # tsbm report command (Markdown report with SQL queries)
     └── dashboard.py        # Streamlit subprocess launcher

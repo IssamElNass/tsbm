@@ -8,10 +8,14 @@
 # Each setting has a comment showing what to change for larger machines:
 #   "# → 16c/64GB"  and  "# → 32c/128GB"
 #
+# Prerequisites (run once on the VM):
+#   sudo bash scripts/setup-perf-vm.sh            # creates /data dirs, kernel tuning
+#   — or automatically via: bash scripts/quickstart.sh --perf
+#
 # Usage:
 #   docker compose -f docker/docker-compose.performance.yml up -d
 #   docker compose -f docker/docker-compose.performance.yml down
-#   docker compose -f docker/docker-compose.performance.yml down -v   # wipe data
+#   sudo rm -rf /data/{questdb,cratedb,timescaledb}/*   # wipe data
 #
 # Port mappings match docker-compose.yml so benchmark.toml needs no changes:
 #   QuestDB:     5001:9000  (ILP HTTP)
@@ -73,17 +77,53 @@ services:
       QDB_CAIRO_SQL_PARALLEL_FILTER_WORKER_COUNT: "16"     # → 32c: 32
       QDB_CAIRO_SQL_PARALLEL_GROUPBY_ENABLED: "true"
 
-      # Write path — 1 M rows buffered before commit (~70 MB at 70 B/row)
-      # Lower than 64GB profile to stay within heap budget on 32GB machines.
-      QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "1000000"            # → 16c/64GB: 4000000  → 32c/128GB: 8000000
+      # Write path — 2 M rows buffered before commit (~140 MB at 70 B/row)
+      # Increased from 1M to improve ingestion throughput; fits in 8g heap.
+      QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "2000000"            # → 16c/64GB: 4000000  → 32c/128GB: 8000000
 
-      # Network — 16 MB receive buffer handles large ILP batches in one read
+      # ── WAL tuning ──────────────────────────────────────────────────────
+      # Time budget (µs) the shared workers spend applying WAL per table
+      # per iteration.  Higher = WAL drains faster but delays other tables.
+      QDB_CAIRO_WAL_APPLY_TABLE_TIME_QUOTA: "500000"       # 500 ms  → 32c/128GB: 1000000
+
+      # Rows per WAL segment before rolling to a new file.
+      # Larger segments = fewer fsyncs but bigger recovery replay.
+      QDB_CAIRO_WAL_SEGMENT_ROLLOVER_ROW_COUNT: "500000"   # → 16c/64GB: 1000000  → 32c/128GB: 2000000
+
+      # Interval (ms) between WAL purge sweeps that reclaim applied segments.
+      # Faster purge keeps disk usage low during sustained ingestion.
+      QDB_CAIRO_WAL_PURGE_INTERVAL: "5000"                 # 5 s (default 30 s)
+
+      # Out-of-order commit lag (µs).  Rows arriving out-of-order within
+      # this window are merged in memory rather than triggering O3 commits.
+      # 60 s is safe for most time-series workloads with minor clock skew.
+      QDB_CAIRO_O3_MAX_LAG: "60000000"                     # 60 s  → 32c/128GB: 120000000
+
+      # Writer data page size — larger pages reduce mmap overhead during
+      # sustained writes.  4 MB is optimal for bulk ingestion workloads.
+      QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE: "4194304"    # 4 MB (default 1 MB)
+
+      # Parallel WAL apply workers — match core count for maximum WAL drain speed.
+      # Critical for 8B+ row ingestion to prevent WAL lag from stalling writers.
+      QDB_WAL_APPLY_WORKER_COUNT: "16"                     # → 32c: 32  → 64c: 64
+
+      # Column memory for O3 merges — larger reduces mmap churn during
+      # out-of-order writes.  8 MB per column during O3 commit.
+      QDB_CAIRO_O3_COLUMN_MEMORY_SIZE: "8388608"           # 8 MB (default 1 MB)
+
+      # ── Network ─────────────────────────────────────────────────────────
+      # 16 MB receive buffer handles large ILP batches in one read
       QDB_LINE_HTTP_RECV_BUFFER_SIZE: "16777216"           # 16 MB  → 16c/64GB: 32 MB (33554432)  → 32c/128GB: 64 MB
+
+      # ILP HTTP worker threads — dedicated threads for ingestion pipeline.
+      # Separate from HTTP_WORKER_COUNT (REST/console).  Match half the
+      # core count so ingestion and queries don't starve each other.
+      QDB_LINE_HTTP_WORKER_COUNT: "8"                      # → 32c: 16
 
       # HTTP handler threads for Web Console and REST queries
       QDB_HTTP_WORKER_COUNT: "8"                           # → 32c: 16
     volumes:
-      - questdb_perf_data:/var/lib/questdb
+      - /data/questdb:/var/lib/questdb
     deploy:
       resources:
         limits:
@@ -157,7 +197,7 @@ services:
       -Cthreadpool.search.size=16                          # → 32c: 32
       -Cthreadpool.write.size=16                           # → 32c: 32
     volumes:
-      - cratedb_perf_data:/data
+      - /data/cratedb:/data
     deploy:
       resources:
         limits:
@@ -280,7 +320,7 @@ services:
     # shm_size must exceed shared_buffers — Docker default of 64 MB will crash.
     shm_size: '8gb'                                        # → 16c/64GB: 18gb  → 32c/128GB: 36gb
     volumes:
-      - timescaledb_perf_data:/var/lib/postgresql/data
+      - /data/timescaledb:/var/lib/postgresql/data
     deploy:
       resources:
         limits:
@@ -296,26 +336,43 @@ services:
       retries: 15
       start_period: 20s
 
-volumes:
-  questdb_perf_data:
-    name: tsbench_perf_questdb_data
-  cratedb_perf_data:
-    name: tsbench_perf_cratedb_data
-  timescaledb_perf_data:
-    name: tsbench_perf_timescaledb_data
+###############################################################################
+# Host volume layout (bind-mounted from /data on the VM):
+#
+#   /data/questdb/       → QuestDB data + WAL segments
+#   /data/cratedb/       → CrateDB Lucene segments
+#   /data/timescaledb/   → TimescaleDB / PostgreSQL data
+#
+# Provision /data on a dedicated high-IOPS volume (NVMe recommended).
+# Pre-create directories before first run:
+#   sudo mkdir -p /data/{questdb,cratedb,timescaledb}
+#   sudo chown -R 10001:10001 /data/questdb      # QuestDB UID
+#   sudo chown -R 1000:1000   /data/cratedb       # CrateDB UID
+#   sudo chown -R 999:999     /data/timescaledb   # PostgreSQL UID
+#
+# To wipe data:  sudo rm -rf /data/{questdb,cratedb,timescaledb}/*
+###############################################################################
 
 ###############################################################################
 # Scaling reference
 #
-#  Setting                             16c/32GB   16c/64GB   32c/128GB
-#  ─────────────────────────────────────────────────────────────────────
-#  QuestDB Java heap (-Xmx)                8g        16g         32g
-#  QuestDB container memory limit         10g        20g         40g
-#  QuestDB shared worker count             16         16          32
-#  QuestDB parallel filter workers         16         16          32
-#  QuestDB HTTP workers                     8          8          16
-#  QuestDB max uncommitted rows         1 000K     4 000K      8 000K
-#  QuestDB ILP recv buffer               16 MB      32 MB       64 MB
+#  Setting                             16c/32GB   16c/64GB   32c/128GB  64c/256GB
+#  ────────────────────────────────────────────────────────────────────────────────
+#  QuestDB Java heap (-Xmx)                8g        16g         32g        64g
+#  QuestDB container memory limit         10g        20g         40g        80g
+#  QuestDB shared worker count             16         16          32         64
+#  QuestDB parallel filter workers         16         16          32         64
+#  QuestDB HTTP workers                     8          8          16         32
+#  QuestDB max uncommitted rows         2 000K     4 000K      8 000K    16 000K
+#  QuestDB WAL apply time quota         500 ms     500 ms    1 000 ms   1 000 ms
+#  QuestDB WAL apply workers               16         16          32         64
+#  QuestDB WAL segment rollover rows   500 000  1 000 000   2 000 000  4 000 000
+#  QuestDB WAL purge interval              5 s        5 s         5 s        5 s
+#  QuestDB O3 max lag                     60 s       60 s       120 s      120 s
+#  QuestDB O3 column memory size         8 MB       8 MB        8 MB       16 MB
+#  QuestDB writer page size              4 MB       4 MB        4 MB        8 MB
+#  QuestDB ILP recv buffer               16 MB      32 MB       64 MB     128 MB
+#  QuestDB ILP HTTP workers                 8          8          16         32
 #  ─────────────────────────────────────────────────────────────────────
 #  CrateDB heap                            8g        16g         32g
 #  CrateDB container memory limit         10g        20g         40g

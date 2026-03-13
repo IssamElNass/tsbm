@@ -32,6 +32,9 @@ class QuestDBConfig(BaseModel):
     # file segments.  For 30 M+ rows spanning many days use HOUR; for sparse
     # multi-year datasets use MONTH or YEAR.
     partition_by: str = "DAY"
+    # Automatically add INDEX on SYMBOL (TAG) columns in CREATE TABLE DDL.
+    # Indexes speed up WHERE filters on tag columns but double write I/O.
+    index_symbols: bool = True
 
 
 class CrateDBConfig(BaseModel):
@@ -73,6 +76,7 @@ class WorkloadConfig(BaseModel):
     warmup_iterations: int = 5
     measurement_rounds: int = 30
     time_windows: list[str] = ["1min", "1h", "1day", "1week"]
+    query_row_limits: list[int] = [10_000, 100_000, 1_000_000]
     prng_seed: int = 42
     mixed_duration_seconds: int = 60
     reset_between_rounds: bool = False

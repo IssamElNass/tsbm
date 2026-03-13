@@ -134,6 +134,16 @@ dataset = "datasets/40m.parquet"
 #     streaming_threshold_rows = 2_000_000
 #     chunk_size = 5_000_000
 #
+#   ~8 B rows (8-billion-row scale test — requires 64 GB+ RAM, NVMe storage):
+#     tsbm generate --devices 50000 --readings 160000 --parts 40 \
+#                   --output datasets/8b.parquet --chunk-rows 1000000
+#     batch_sizes = [1_000_000, 5_000_000]
+#     workers     = [1, 2, 4]
+#     warmup_iterations  = 1
+#     measurement_rounds = 2
+#     streaming_threshold_rows = 2_000_000
+#     chunk_size = 10_000_000
+#
 # Memory budget: workers × batch_size × ~70 bytes live in RAM simultaneously.
 #   4 workers × 2 M rows × 70 bytes ≈ 560 MB  ← safe on 8 GB machines
 #   4 workers × 5 M rows × 70 bytes ≈ 1.4 GB  ← safe on 16 GB machines
@@ -157,6 +167,11 @@ measurement_rounds = 5
 # For sparse datasets (few rows per minute), narrow windows scan fewer rows
 # and finish faster; wide windows stress sequential scan performance.
 time_windows = ["1min", "1h", "1day", "1week"]
+
+# Row limits applied to query benchmarks (LIMIT clause).
+# Each limit is benchmarked independently, producing per-limit results.
+# Prevents full-table scans returning billions of rows and causing timeouts.
+query_row_limits = [10_000, 100_000, 1_000_000]
 
 # Seed for reproducible random time-window generation.
 prng_seed = 42

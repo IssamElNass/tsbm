@@ -170,6 +170,11 @@ def _random_windows(
     return windows
 
 
+def _limit_clause(row_limit: int) -> str:
+    """Return a SQL LIMIT clause if row_limit > 0, else empty string."""
+    return f" LIMIT {row_limit}" if row_limit > 0 else ""
+
+
 def _window_from_config(cfg_str: str) -> timedelta:
     """Parse a window string like '1min', '1h', '1day', '1week' into timedelta."""
     mapping = {
@@ -239,111 +244,116 @@ class _QueryBenchmarkBase:
             else ([config.time_windows[0]] if config.time_windows else ["1h"])
         )
 
+        # Row limits to sweep — each produces a separate result set.
+        row_limits: list[int] = getattr(config, "query_row_limits", None) or [0]
+
         workers_list: list[int] = config.workers if config.workers else [1]
 
         for workers in workers_list:
             for window_cfg_str in windows_to_run:
-                # Operation name includes the window size when iterating multiple windows
-                # so results are stored and reported separately (e.g. time_range_1min).
-                operation = (
-                    f"{self.name}_{window_cfg_str}"
-                    if self._iterate_time_windows and len(windows_to_run) > 1
-                    else self.name
-                )
+                for row_limit in row_limits:
+                    # Operation name includes window size and row limit
+                    # so results are stored separately (e.g. time_range_1min_limit_10000).
+                    parts = [self.name]
+                    if self._iterate_time_windows and len(windows_to_run) > 1:
+                        parts.append(window_cfg_str)
+                    if row_limit > 0 and len(row_limits) > 1:
+                        parts.append(f"limit_{row_limit}")
+                    operation = "_".join(parts)
 
-                # Generate enough windows for warmup (sequential) + measurement
-                # rounds × workers (each concurrent slot gets its own distinct window).
-                windows = _random_windows(
-                    n=config.warmup_iterations + config.measurement_rounds * workers,
-                    table=_ts_table,
-                    ts_col=schema.timestamp_col,
-                    window_duration=_window_from_config(window_cfg_str),
-                    seed=config.prng_seed,
-                )
-                if not windows:
-                    result.errors.append(
-                        f"No valid time windows for window size {window_cfg_str!r}; "
-                        "dataset may be empty or smaller than the window."
+                    # Generate enough windows for warmup (sequential) + measurement
+                    # rounds × workers (each concurrent slot gets its own distinct window).
+                    windows = _random_windows(
+                        n=config.warmup_iterations + config.measurement_rounds * workers,
+                        table=_ts_table,
+                        ts_col=schema.timestamp_col,
+                        window_duration=_window_from_config(window_cfg_str),
+                        seed=config.prng_seed,
                     )
-                    continue
-
-                queries = self._make_queries(schema, adapter.name, windows, config)
-
-                # ---- Warmup (always sequential — prime caches, not stress test) ----
-                for i, (sql, params) in enumerate(queries[: config.warmup_iterations]):
-                    try:
-                        _, timing = await adapter.execute_query(sql, params)
-                        result.operation_results.append(
-                            OperationResult.from_timing(
-                                run_id=run_id,
-                                database_name=adapter.name,
-                                operation=operation,
-                                phase="warmup",
-                                iteration=i,
-                                timing=timing,
-                                workers=workers,
-                            )
+                    if not windows:
+                        result.errors.append(
+                            f"No valid time windows for window size {window_cfg_str!r}; "
+                            "dataset may be empty or smaller than the window."
                         )
-                    except Exception as exc:
-                        logger.warning(
-                            "Warmup error (db=%s op=%s iter=%d): %s",
-                            adapter.name, operation, i, exc,
-                        )
+                        continue
 
-                # ---- Measurement ----
-                # Each round fires `workers` queries concurrently, each against its
-                # own distinct random window.  With workers=1 this is identical to
-                # the previous sequential behaviour.
-                measurement_timings: list[TimingResult] = []
-                warmup_n = config.warmup_iterations
-                op_index = 0
-                for i in range(config.measurement_rounds):
-                    batch = queries[warmup_n + i * workers : warmup_n + (i + 1) * workers]
-                    raw = await asyncio.gather(
-                        *[adapter.execute_query(sql, p) for sql, p in batch],
-                        return_exceptions=True,
-                    )
-                    for item in raw:
-                        if isinstance(item, Exception):
-                            msg = (
-                                f"Query error (db={adapter.name} op={operation} "
-                                f"round={i} workers={workers}): {item}"
+                    queries = self._make_queries(schema, adapter.name, windows, config, row_limit=row_limit)
+
+                    # ---- Warmup (always sequential — prime caches, not stress test) ----
+                    for i, (sql, params) in enumerate(queries[: config.warmup_iterations]):
+                        try:
+                            _, timing = await adapter.execute_query(sql, params)
+                            result.operation_results.append(
+                                OperationResult.from_timing(
+                                    run_id=run_id,
+                                    database_name=adapter.name,
+                                    operation=operation,
+                                    phase="warmup",
+                                    iteration=i,
+                                    timing=timing,
+                                    workers=workers,
+                                )
                             )
-                            logger.error(msg)
-                            result.errors.append(msg)
-                            continue
-                        rows_returned, timing = item
-                        if not rows_returned and self._iterate_time_windows:
+                        except Exception as exc:
                             logger.warning(
-                                "Query returned 0 rows (db=%s op=%s round=%d) "
-                                "— possible data visibility issue",
-                                adapter.name, operation, i,
+                                "Warmup error (db=%s op=%s iter=%d): %s",
+                                adapter.name, operation, i, exc,
                             )
-                        measurement_timings.append(timing)
-                        result.operation_results.append(
-                            OperationResult.from_timing(
+
+                    # ---- Measurement ----
+                    # Each round fires `workers` queries concurrently, each against its
+                    # own distinct random window.  With workers=1 this is identical to
+                    # the previous sequential behaviour.
+                    measurement_timings: list[TimingResult] = []
+                    warmup_n = config.warmup_iterations
+                    op_index = 0
+                    for i in range(config.measurement_rounds):
+                        batch = queries[warmup_n + i * workers : warmup_n + (i + 1) * workers]
+                        raw = await asyncio.gather(
+                            *[adapter.execute_query(sql, p) for sql, p in batch],
+                            return_exceptions=True,
+                        )
+                        for item in raw:
+                            if isinstance(item, Exception):
+                                msg = (
+                                    f"Query error (db={adapter.name} op={operation} "
+                                    f"round={i} workers={workers}): {item}"
+                                )
+                                logger.error(msg)
+                                result.errors.append(msg)
+                                continue
+                            rows_returned, timing = item
+                            if not rows_returned and self._iterate_time_windows:
+                                logger.warning(
+                                    "Query returned 0 rows (db=%s op=%s round=%d) "
+                                    "— possible data visibility issue",
+                                    adapter.name, operation, i,
+                                )
+                            measurement_timings.append(timing)
+                            result.operation_results.append(
+                                OperationResult.from_timing(
+                                    run_id=run_id,
+                                    database_name=adapter.name,
+                                    operation=operation,
+                                    phase="measurement",
+                                    iteration=op_index,
+                                    timing=timing,
+                                    workers=workers,
+                                )
+                            )
+                            op_index += 1
+
+                    if measurement_timings:
+                        result.summaries.append(
+                            _build_summary(
                                 run_id=run_id,
                                 database_name=adapter.name,
                                 operation=operation,
-                                phase="measurement",
-                                iteration=op_index,
-                                timing=timing,
+                                batch_size=0,
                                 workers=workers,
+                                timings=measurement_timings,
                             )
                         )
-                        op_index += 1
-
-                if measurement_timings:
-                    result.summaries.append(
-                        _build_summary(
-                            run_id=run_id,
-                            database_name=adapter.name,
-                            operation=operation,
-                            batch_size=0,
-                            workers=workers,
-                            timings=measurement_timings,
-                        )
-                    )
 
         return result
 
@@ -353,6 +363,7 @@ class _QueryBenchmarkBase:
         adapter_name: str,
         windows: list[tuple[datetime, datetime]],
         config: Any,
+        row_limit: int = 0,
     ) -> list[tuple[str, tuple]]:
         """Return a list of (sql, params) tuples for the full query set."""
         raise NotImplementedError
@@ -372,10 +383,10 @@ class _QueryBenchmarkBase:
 
 
 class TimeRangeBenchmark(_QueryBenchmarkBase):
-    """Scan all rows within a random time window."""
+    """Scan rows within a random time window (with LIMIT)."""
 
     name = "time_range"
-    description = "Scans all rows within a random time window (WHERE ts >= start AND ts < end)."
+    description = "Scans rows within a random time window (WHERE ts >= start AND ts < end) with LIMIT."
 
     def _make_queries(
         self,
@@ -383,24 +394,28 @@ class TimeRangeBenchmark(_QueryBenchmarkBase):
         adapter_name: str,
         windows: list[tuple[datetime, datetime]],
         config: Any,
+        row_limit: int = 0,
     ) -> list[tuple[str, tuple]]:
         tbl = schema.name
         ts = schema.timestamp_col
         cols = _all_columns_sql(schema)
+        limit = _limit_clause(row_limit)
         queries = []
         for start, end in windows:
             if adapter_name == _DB_QUESTDB:
-                # QuestDB: use f-string with ISO timestamps (no $1 parameterisation)
-                # Explicit column list avoids asyncpg codec failures on SYMBOL columns.
                 s = start.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 e = end.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 sql = (
                     f'SELECT {cols} FROM "{tbl}" '
                     f'WHERE "{ts}" >= \'{s}\' AND "{ts}" < \'{e}\''
+                    f'{limit}'
                 )
                 queries.append((sql, ()))
             else:
-                sql = f'SELECT {cols} FROM "{tbl}" WHERE "{ts}" >= $1 AND "{ts}" < $2'
+                sql = (
+                    f'SELECT {cols} FROM "{tbl}" WHERE "{ts}" >= $1 AND "{ts}" < $2'
+                    f'{limit}'
+                )
                 queries.append((sql, (start, end)))
         return queries
 
@@ -434,10 +449,12 @@ class AggregationBenchmark(_QueryBenchmarkBase):
         adapter_name: str,
         windows: list[tuple[datetime, datetime]],
         config: Any,
+        row_limit: int = 0,
     ) -> list[tuple[str, tuple]]:
         tbl = schema.name
         ts = schema.timestamp_col
         metric = _pick_metric(schema, config)
+        limit = _limit_clause(row_limit)
         queries = []
 
         for start, end in windows:
@@ -449,6 +466,7 @@ class AggregationBenchmark(_QueryBenchmarkBase):
                     f'FROM "{tbl}" '
                     f'WHERE "{ts}" >= \'{s}\' AND "{ts}" < \'{e}\' '
                     f"SAMPLE BY 1h"
+                    f"{limit}"
                 )
                 queries.append((sql, ()))
             elif adapter_name == _DB_CRATEDB:
@@ -458,6 +476,7 @@ class AggregationBenchmark(_QueryBenchmarkBase):
                     f'FROM "{tbl}" '
                     f'WHERE "{ts}" >= $1 AND "{ts}" < $2 '
                     f"GROUP BY bucket ORDER BY bucket"
+                    f"{limit}"
                 )
                 queries.append((sql, (start, end)))
             else:  # timescaledb
@@ -467,6 +486,7 @@ class AggregationBenchmark(_QueryBenchmarkBase):
                     f'FROM "{tbl}" '
                     f'WHERE "{ts}" >= $1 AND "{ts}" < $2 '
                     f"GROUP BY bucket ORDER BY bucket"
+                    f"{limit}"
                 )
                 queries.append((sql, (start, end)))
         return queries
@@ -500,14 +520,12 @@ class AggregationBenchmark(_QueryBenchmarkBase):
 
 
 class LastPointBenchmark(_QueryBenchmarkBase):
-    """Latest value per device (tag)."""
+    """Latest value per device (tag) within a time window."""
 
     name = "last_point"
-    description = "Retrieves the most recent metric value for each unique tag value."
-    # Does not filter on a time range — the query always scans the full table.
-    # Iterating multiple window sizes would repeat the same full-table query N times
-    # without adding any new information.
-    _iterate_time_windows = False
+    description = "Retrieves the most recent metric value for each unique tag value within a time window."
+    # Now uses time windows to avoid full-table scans on billion-row tables.
+    _iterate_time_windows = True
 
     def _make_queries(
         self,
@@ -515,40 +533,48 @@ class LastPointBenchmark(_QueryBenchmarkBase):
         adapter_name: str,
         windows: list[tuple[datetime, datetime]],
         config: Any,
+        row_limit: int = 0,
     ) -> list[tuple[str, tuple]]:
         tbl = schema.name
         ts = schema.timestamp_col
         tag = _pick_tag(schema, config)
         metric = _pick_metric(schema, config)
+        limit = _limit_clause(row_limit)
         queries = []
 
-        for _ in windows:
+        for start, end in windows:
             if adapter_name == _DB_QUESTDB:
+                s = start.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                e = end.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                 sql = (
                     f'SELECT "{tag}", "{metric}", "{ts}" '
                     f'FROM "{tbl}" '
+                    f'WHERE "{ts}" >= \'{s}\' AND "{ts}" < \'{e}\' '
                     f'LATEST ON "{ts}" PARTITION BY "{tag}"'
+                    f'{limit}'
                 )
                 queries.append((sql, ()))
             elif adapter_name == _DB_CRATEDB:
-                # CrateDB does not support DISTINCT ON (PostgreSQL-specific).
-                # Use a ROW_NUMBER() window function subquery instead.
                 sql = (
                     f'SELECT "{tag}", "{metric}", "{ts}" '
                     f'FROM ('
                     f'SELECT "{tag}", "{metric}", "{ts}", '
                     f'ROW_NUMBER() OVER (PARTITION BY "{tag}" ORDER BY "{ts}" DESC) AS _rn '
-                    f'FROM "{tbl}"'
+                    f'FROM "{tbl}" '
+                    f'WHERE "{ts}" >= $1 AND "{ts}" < $2'
                     f') _sub WHERE _rn = 1 ORDER BY "{tag}"'
+                    f'{limit}'
                 )
-                queries.append((sql, ()))
+                queries.append((sql, (start, end)))
             else:  # timescaledb
                 sql = (
                     f'SELECT DISTINCT ON ("{tag}") "{tag}", "{metric}", "{ts}" '
                     f'FROM "{tbl}" '
+                    f'WHERE "{ts}" >= $1 AND "{ts}" < $2 '
                     f'ORDER BY "{tag}", "{ts}" DESC'
+                    f'{limit}'
                 )
-                queries.append((sql, ()))
+                queries.append((sql, (start, end)))
         return queries
 
     def get_queries(
@@ -562,12 +588,15 @@ class LastPointBenchmark(_QueryBenchmarkBase):
         metric = schema.metric_cols[0] if schema.metric_cols else "value"
         if adapter_name == _DB_QUESTDB:
             return [(self.name,
-                f'SELECT "{tag}", "{metric}", "{ts}" FROM "{tbl}" LATEST ON "{ts}" PARTITION BY "{tag}"')]
+                f'SELECT "{tag}", "{metric}", "{ts}" FROM "{tbl}" '
+                f'WHERE "{ts}" >= \'<start>\' AND "{ts}" < \'<end>\' '
+                f'LATEST ON "{ts}" PARTITION BY "{tag}"')]
         return [(self.name,
             f'SELECT "{tag}", "{metric}", "{ts}" FROM ('
             f'SELECT "{tag}", "{metric}", "{ts}", '
             f'ROW_NUMBER() OVER (PARTITION BY "{tag}" ORDER BY "{ts}" DESC) AS _rn '
-            f'FROM "{tbl}") _sub WHERE _rn = 1 ORDER BY "{tag}"')]
+            f'FROM "{tbl}" WHERE "{ts}" >= $1 AND "{ts}" < $2'
+            f') _sub WHERE _rn = 1 ORDER BY "{tag}"')]
 
 
 # ---------------------------------------------------------------------------
@@ -591,11 +620,13 @@ class HighCardinalityBenchmark(_QueryBenchmarkBase):
         adapter_name: str,
         windows: list[tuple[datetime, datetime]],
         config: Any,
+        row_limit: int = 0,
     ) -> list[tuple[str, tuple]]:
         tbl = schema.name
         ts = schema.timestamp_col
         tag = _pick_tag(schema, config)
         metric = _pick_metric(schema, config)
+        limit = _limit_clause(row_limit)
         queries = []
 
         for start, end in windows:
@@ -607,6 +638,7 @@ class HighCardinalityBenchmark(_QueryBenchmarkBase):
                     f'FROM "{tbl}" '
                     f'WHERE "{ts}" >= \'{s}\' AND "{ts}" < \'{e}\' '
                     f'GROUP BY "{tag}" ORDER BY "{tag}"'
+                    f'{limit}'
                 )
                 queries.append((sql, ()))
             else:
@@ -615,6 +647,7 @@ class HighCardinalityBenchmark(_QueryBenchmarkBase):
                     f'FROM "{tbl}" '
                     f'WHERE "{ts}" >= $1 AND "{ts}" < $2 '
                     f'GROUP BY "{tag}" ORDER BY "{tag}"'
+                    f'{limit}'
                 )
                 queries.append((sql, (start, end)))
         return queries
@@ -644,18 +677,17 @@ class HighCardinalityBenchmark(_QueryBenchmarkBase):
 
 class DownsamplingBenchmark(_QueryBenchmarkBase):
     """
-    Multi-resolution downsampling over the full dataset range.
+    Multi-resolution downsampling within time windows from config.
 
     Cycles through granularities: 1 minute, 1 hour, 1 day.
     Each measurement round uses the next granularity in the cycle.
+    Uses time windows from the TOML config to avoid full-table scans.
     """
 
     name = "downsampling"
-    description = "Multi-resolution time-series downsampling (1min / 1h / 1day)."
-    # Manages its own granularity cycling internally (_GRANULARITIES_* lists).
-    # Delegating window iteration to the base class would nest two separate
-    # cycling loops and produce confusing operation names.
-    _iterate_time_windows = False
+    description = "Multi-resolution time-series downsampling (1min / 1h / 1day) within time windows."
+    # Now iterates time windows from config to avoid full-table scans.
+    _iterate_time_windows = True
 
     _GRANULARITIES_QUESTDB = ["1m", "1h", "1d"]
     _GRANULARITIES_DATE_BIN = ["1 minute", "1 hour", "1 day"]
@@ -667,10 +699,12 @@ class DownsamplingBenchmark(_QueryBenchmarkBase):
         adapter_name: str,
         windows: list[tuple[datetime, datetime]],
         config: Any,
+        row_limit: int = 0,
     ) -> list[tuple[str, tuple]]:
         tbl = schema.name
         ts = schema.timestamp_col
         metric = _pick_metric(schema, config)
+        limit = _limit_clause(row_limit)
         queries = []
 
         for i, (start, end) in enumerate(windows):
@@ -683,6 +717,7 @@ class DownsamplingBenchmark(_QueryBenchmarkBase):
                     f'FROM "{tbl}" '
                     f'WHERE "{ts}" >= \'{s}\' AND "{ts}" < \'{e}\' '
                     f"SAMPLE BY {gran}"
+                    f"{limit}"
                 )
                 queries.append((sql, ()))
             elif adapter_name == _DB_CRATEDB:
@@ -693,6 +728,7 @@ class DownsamplingBenchmark(_QueryBenchmarkBase):
                     f'FROM "{tbl}" '
                     f'WHERE "{ts}" >= $1 AND "{ts}" < $2 '
                     f"GROUP BY bucket ORDER BY bucket"
+                    f"{limit}"
                 )
                 queries.append((sql, (start, end)))
             else:  # timescaledb
@@ -703,6 +739,7 @@ class DownsamplingBenchmark(_QueryBenchmarkBase):
                     f'FROM "{tbl}" '
                     f'WHERE "{ts}" >= $1 AND "{ts}" < $2 '
                     f"GROUP BY bucket ORDER BY bucket"
+                    f"{limit}"
                 )
                 queries.append((sql, (start, end)))
         return queries

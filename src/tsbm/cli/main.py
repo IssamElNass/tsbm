@@ -8,6 +8,7 @@ Commands
   run        Run a benchmark workload against one or more databases.
   generate   Generate a synthetic IoT dataset and write it to Parquet/CSV.
   load       Ingest a dataset into a database without benchmarking.
+  seed       Seed QuestDB with data (no benchmarks, WAL throttle, rows/sec).
   compare    Compare results from two or more runs.
   dashboard  Launch the Streamlit results dashboard.
 """
@@ -23,7 +24,7 @@ import typer
 from rich.console import Console
 from typing_extensions import Annotated
 
-from tsbm.cli.run import async_run, async_generate, async_load
+from tsbm.cli.run import async_run, async_generate, async_load, async_seed
 from tsbm.cli.compare import async_compare
 from tsbm.cli.dashboard import launch_dashboard
 from tsbm.cli.report import async_report
@@ -171,6 +172,56 @@ def cmd_load(
         dataset_path=dataset,
         config_path=config,
         drop_first=drop,
+    ))
+
+
+# ---------------------------------------------------------------------------
+# seed (QuestDB only)
+# ---------------------------------------------------------------------------
+
+
+@app.command("seed")
+def cmd_seed(
+    config: Annotated[
+        Optional[Path],
+        typer.Option("--config", "-c", help="Path to benchmark.toml."),
+    ] = None,
+    dataset: Annotated[
+        Optional[List[str]],
+        typer.Option("--dataset", help="Override dataset path(s). Repeat for multiple files. Supports globs and az:// URLs."),
+    ] = None,
+    timestamp_col: Annotated[
+        Optional[str],
+        typer.Option("--timestamp-col", help="Name of the timestamp column (overrides auto-detection)."),
+    ] = None,
+    drop: Annotated[
+        bool,
+        typer.Option("--drop/--no-drop", help="Drop existing table before seeding."),
+    ] = True,
+    workers: Annotated[
+        int,
+        typer.Option("--workers", "-w", help="Number of parallel ingest workers. 0 = use config value."),
+    ] = 0,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Enable debug logging."),
+    ] = False,
+) -> None:
+    """Seed QuestDB with the full dataset — no benchmarks.
+
+    Uses parallel workers and WAL-lag throttling. Shows live rows/sec.
+    """
+    _setup_logging(verbose)
+    dataset_path = Path(dataset[0]) if dataset and len(dataset) == 1 else None
+    dataset_list = list(dataset) if dataset and len(dataset) > 1 else None
+    asyncio.run(async_seed(
+        config_path=config,
+        dataset_path=dataset_path,
+        dataset_list=dataset_list,
+        timestamp_col=timestamp_col,
+        drop_first=drop,
+        seed_workers=workers,
+        verbose=verbose,
     ))
 
 
